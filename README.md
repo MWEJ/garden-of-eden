@@ -6,6 +6,12 @@ Truly own that which is yours!
 
 If you are interested in collaborating please review the [CONTRIBUTORS](CONTRIBUTORS.md) for commit styling guides.
 
+## Video Tutorial for Gardyn of Eden and Homeassistant
+
+Thanks to "Yong" for very well edited video tutuorial.
+
+[Video Tutorial](https://www.youtube.com/watch?v=gH5yu8JwS8Y)
+
 ## Project Status & Milestones
 
 Work in progress. We should be picking up some steam here to give the DYI community the features you deserve.
