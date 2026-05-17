@@ -8,7 +8,7 @@ If you are interested in collaborating please review the [CONTRIBUTORS](CONTRIBU
 
 ## Video Tutorial for Gardyn of Eden and Homeassistant
 
-Thanks to "Yong" for very well edited video tutuorial.
+Thanks to "Yong" for very well edited video tutorial.
 
 [Video Tutorial](https://www.youtube.com/watch?v=gH5yu8JwS8Y)
 
