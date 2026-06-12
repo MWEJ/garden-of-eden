@@ -61,4 +61,10 @@ func TestMockSensors(t *testing.T) {
 	if r, err := d.Power.Read(); err != nil || r.BusVoltage == 0 {
 		t.Errorf("power = %+v err %v", r, err)
 	}
+	if b := d.Button.Events(); b == nil {
+		t.Error("button events channel is nil")
+	}
+	if img, err := d.UpperCamera.Capture(); err != nil || len(img) == 0 {
+		t.Errorf("camera capture = %v bytes, err %v", len(img), err)
+	}
 }

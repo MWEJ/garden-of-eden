@@ -93,12 +93,7 @@ func (Camera) Capture() ([]byte, error) { return []byte{0xFF, 0xD8, 0xFF, 0xD9},
 
 type Button struct{ ch chan hw.ButtonEvent }
 
-func (b *Button) Events() <-chan hw.ButtonEvent {
-	if b.ch == nil {
-		b.ch = make(chan hw.ButtonEvent)
-	}
-	return b.ch
-}
+func (b *Button) Events() <-chan hw.ButtonEvent { return b.ch }
 
 // New returns a Devices bundle backed by mocks.
 func New() hw.Devices {
@@ -111,6 +106,6 @@ func New() hw.Devices {
 		Power:       Power{},
 		UpperCamera: Camera{},
 		LowerCamera: Camera{},
-		Button:      &Button{},
+		Button:      &Button{ch: make(chan hw.ButtonEvent)},
 	}
 }
