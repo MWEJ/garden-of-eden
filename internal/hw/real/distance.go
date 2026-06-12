@@ -24,6 +24,10 @@ func NewHCSR04(chip string, trigger, echo int) *HCSR04 {
 	return &HCSR04{chip: chip, trigger: trigger, echo: echo}
 }
 
+// MeasureCM pings 10× and returns the median distance in cm. It holds an
+// internal lock for the whole sweep; worst case (all samples time out) is
+// ~1.9s of blocking, so latency-sensitive callers should invoke it from a
+// goroutine with an external deadline.
 func (h *HCSR04) MeasureCM() (float64, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -33,7 +37,7 @@ func (h *HCSR04) MeasureCM() (float64, error) {
 		if cm, err := h.measureOnce(); err == nil {
 			samples = append(samples, cm)
 		}
-		time.Sleep(20 * time.Millisecond) // avoid echo overlap
+		time.Sleep(60 * time.Millisecond) // HC-SR04 datasheet: >=60ms between pings so the prior echo decays
 	}
 	return medianOrErr(samples)
 }
@@ -50,7 +54,7 @@ func (h *HCSR04) measureOnce() (float64, error) {
 	echo, err := gpiocdev.RequestLine(h.chip, h.echo,
 		gpiocdev.WithBothEdges,
 		gpiocdev.WithEventHandler(func(ev gpiocdev.LineEvent) {
-			ts := time.Now()
+			ts := time.Now() // TODO(on-Pi): ev.Timestamp (kernel monotonic) is more precise
 			if ev.Type == gpiocdev.LineEventRisingEdge {
 				select {
 				case rise <- ts:
@@ -67,6 +71,15 @@ func (h *HCSR04) measureOnce() (float64, error) {
 		return 0, err
 	}
 	defer echo.Close()
+
+	// Drain any spurious edge events captured before the trigger pulse, so a
+	// stale rising edge can't be mistaken for t0.
+	for len(rise) > 0 {
+		<-rise
+	}
+	for len(fall) > 0 {
+		<-fall
+	}
 
 	// 10µs trigger pulse.
 	_ = trig.SetValue(1)
@@ -86,7 +99,7 @@ func (h *HCSR04) measureOnce() (float64, error) {
 		if cm <= 0 || cm > 400 {
 			return 0, fmt.Errorf("implausible distance %.1fcm", cm)
 		}
-		return round2(cm), nil
+		return cm, nil
 	case <-time.After(60 * time.Millisecond):
 		return 0, fmt.Errorf("echo fall timeout")
 	}

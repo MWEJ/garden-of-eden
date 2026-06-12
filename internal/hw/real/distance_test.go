@@ -21,7 +21,7 @@ func TestMedian(t *testing.T) {
 	}
 }
 
-func TestMedianEmptyPanicsGuard(t *testing.T) {
+func TestMedianOrErrEmpty(t *testing.T) {
 	if _, err := medianOrErr(nil); err == nil {
 		t.Error("expected error for empty input")
 	}
