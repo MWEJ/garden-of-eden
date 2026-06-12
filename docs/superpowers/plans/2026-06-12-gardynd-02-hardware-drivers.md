@@ -1456,11 +1456,12 @@ Expected: builds; config + hw tests PASS.
 Append to `internal/httpapi/httpapi_test.go`:
 ```go
 func TestDistanceRoute(t *testing.T) {
+	st := state.New()
 	devs := mock.New()
-	c := core.New(devs)
+	c := core.New(devs, st)
 	go c.Run()
 	defer c.Stop()
-	h := HandlerWithSensors(c, devs)
+	h := sensorMux(c, st, devs)
 
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/distance", nil))
@@ -1469,24 +1470,27 @@ func TestDistanceRoute(t *testing.T) {
 	}
 }
 ```
+(Add the `state` import to the test file.)
 
 - [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./internal/httpapi/ -run Distance -v`
-Expected: build failure — `undefined: HandlerWithSensors`.
+Expected: build failure — `undefined: sensorMux`.
 
 - [ ] **Step 3: Add sensor routes**
 
-In `internal/httpapi/httpapi.go`, refactor so `Handler(c)` calls
-`HandlerWithSensors(c, hw.Devices{})` and add the sensor handler:
+In `internal/httpapi/httpapi.go`, add `sensorMux` building on Plan 1's
+`baseMux(c, st)`. (Plan 3's `HandlerFull` will build on `sensorMux`.)
 ```go
-import "github.com/iot-root/garden-of-eden/internal/hw"
+import (
+	"github.com/iot-root/garden-of-eden/internal/hw"
+	"github.com/iot-root/garden-of-eden/internal/state"
+)
 
-func Handler(c *core.Core) http.Handler { return HandlerWithSensors(c, hw.Devices{}) }
-
-// HandlerWithSensors adds read-only sensor GET routes (parity with Flask).
-func HandlerWithSensors(c *core.Core, d hw.Devices) http.Handler {
-	mux := baseControlMux(c) // the *http.ServeMux built in Plan 1
+// sensorMux returns the base control mux plus read-only sensor GET routes
+// (parity with Flask). Returns *http.ServeMux so later plans can add routes.
+func sensorMux(c *core.Core, st *state.Store, d hw.Devices) *http.ServeMux {
+	mux := baseMux(c, st) // the *http.ServeMux built in Plan 1
 
 	if d.Distance != nil {
 		mux.HandleFunc("GET /distance", func(w http.ResponseWriter, _ *http.Request) {
@@ -1535,29 +1539,37 @@ func sensorFloat(w http.ResponseWriter, key string, v float64, err error) {
 	writeJSON(w, http.StatusOK, map[string]string{key: fmt.Sprintf("%.2f", v)})
 }
 ```
-Refactor the Plan 1 `Handler` body into `func baseControlMux(c *core.Core) *http.ServeMux`
-returning the mux (so both entry points share it), and add `"fmt"` to imports.
+Plan 1 already exposes `baseMux(c *core.Core, st *state.Store) *http.ServeMux`;
+`sensorMux` extends it. Add `"fmt"` to imports.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/httpapi/ -v`
 Expected: PASS.
 
+Also add an exported wrapper so `main` can mount the sensor routes in the
+interim (Plan 3 replaces it with `HandlerFull`):
+```go
+// HandlerWithSensors is the control + sensor-read API (interim until Plan 3).
+func HandlerWithSensors(c *core.Core, st *state.Store, d hw.Devices) http.Handler {
+	return sensorMux(c, st, d)
+}
+```
+
 - [ ] **Step 5: Wire `--hw=real` in main**
 
 In `cmd/gardynd/main.go`, replace the `case "real":` fatal with:
 ```go
 case "real":
-	var cleanup func()
-	devs, cleanup, err = real.New(cfg)
-	if err != nil {
-		log.Fatalf("hardware init: %v", err)
+	d, cleanup, herr := real.New(cfg)
+	if herr != nil {
+		log.Fatalf("hardware init: %v", herr)
 	}
+	devs = d
 	defer cleanup()
 ```
-Add imports `"github.com/iot-root/garden-of-eden/internal/hw/real"`, declare
-`var err error` appropriately, and change the HTTP handler to
-`httpapi.HandlerWithSensors(c, devs)`.
+Add import `"github.com/iot-root/garden-of-eden/internal/hw/real"`, and change the
+HTTP handler to `httpapi.HandlerWithSensors(c, st, devs)`.
 
 - [ ] **Step 6: Build, cross-compile, full suite**
 
@@ -1597,8 +1609,9 @@ returning `hw.PowerReading`, `Button.Events`→`hw.ButtonEvent`) are implemented
 with matching signatures in both `real` and `mock`. `round2` is defined once
 (distance.go) and reused by power.go (same package). `config.CameraConfig` /
 `SensorType` added in Task 10 are consumed in `real.New` and `applyEnv`
-consistently. `HandlerWithSensors(c, hw.Devices)` is used by both the test and
-main.
+consistently. `sensorMux(c, st, d)` builds on Plan 1's `baseMux(c, st)`; the
+exported `HandlerWithSensors(c, st, d)` wrapper is used by the interim main and
+superseded by Plan 3's `HandlerFull`.
 
 **Dependency audit:** Task 1 modifies `hw.go`/`mock.go`; every other task uses
 those types → all depend on Task 1 (declared). Tasks 6 and 7 use `Bus` from

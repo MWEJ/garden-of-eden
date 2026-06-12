@@ -78,18 +78,10 @@ are fine).
 
 `config.example.yaml`:
 ```yaml
-mqtt:
-  broker: localhost
-  port: 1883
-  username: ""
-  password: ""
-  keepalive: 60
-
 http:
   port: 5000
 
 device:
-  base_topic: gardyn
   identifier: gardyn-xx
   model: "gardyn 3.0"
   version: "1.0.0"
@@ -218,9 +210,10 @@ Insert a new top section after the project intro covering exactly these points:
 ```markdown
 ## Running gardynd (Go service)
 
-gardynd replaces the Python Flask + MQTT services with a single static binary.
-It needs only an MQTT broker (mosquitto) at runtime — no pigpiod, no fswebcam,
-no Python venv.
+gardynd replaces the Python Flask + MQTT services with a single static binary
+exposing one local REST API — no broker, no pigpiod, no fswebcam, no Python
+venv. **Nothing external is required at runtime.** Home Assistant connects via
+the dedicated gardynd custom integration (separate repo/release).
 
 ### One-time Pi setup
 1. Enable I2C and hardware PWM in `/boot/config.txt` (or
@@ -236,28 +229,28 @@ no Python venv.
 1. Download `gardynd-armv6` from the latest release (or `make build-pi`) and
    copy it to `/usr/local/bin/gardynd`.
 2. Copy `config.example.yaml` to `/etc/gardynd/config.yaml` and edit it
-   (MQTT credentials, `identifier`, schedules).
+   (`identifier`, schedules, optional water threshold).
 3. Install the service:
    ```
    sudo cp services/etc/systemd/system/gardynd.service /etc/systemd/system/
    sudo systemctl daemon-reload
    sudo systemctl enable --now gardynd
    ```
-4. Verify: `journalctl -u gardynd -f`, then check Home Assistant for the
-   auto-discovered `gardyn` device.
+4. Verify: `journalctl -u gardynd -f` and `curl localhost:5000/state`. Then add
+   the gardynd integration in Home Assistant (auto-discovered via zeroconf, or
+   enter the Pi's host/port).
 
 ### Side-by-side bring-up (recommended before cutover)
-Run gardynd on alternate topic/port while the Python service still runs:
+Run gardynd on an alternate HTTP port while the Python service still runs:
 ```
-gardynd --hw=real --config /etc/gardynd/config.yaml \
-  # set device.base_topic: gardyn2 and http.port: 5001 in a temp config
+gardynd --hw=real --config /etc/gardynd/config.yaml --http-port 5001
 ```
-Compare readings in Home Assistant, then switch over by stopping the old
-`mqtt.service` and setting gardynd back to `base_topic: gardyn`.
+Exercise control + `curl localhost:5001/state`, then switch over by stopping the
+old `mqtt.service` and running gardynd on the default port.
 
 ### Config / env compatibility
-Existing `.env` variables (`MQTT_BROKER`, `MQTT_IDENTIFIER`, `WATER_LOW_CM`,
-`SENSOR_TYPE`, camera devices, …) still override the YAML during migration.
+Existing `.env` variables (`MQTT_IDENTIFIER`, `WATER_LOW_CM`, `SENSOR_TYPE`,
+camera devices, …) still override the YAML during migration.
 ```
 
 - [ ] **Step 2: Add a deprecation pointer for the Python service**
@@ -308,13 +301,13 @@ editing the on-device schedule is planned (separate project).
 
 > **GATE — do not perform Task 6 until every box is checked on the actual Pi:**
 > - [ ] gardynd running via systemd for ≥24h with `Restart=always`, no crash loops
-> - [ ] Light + pump controllable from Home Assistant and `bin/` scripts (REST)
+> - [ ] Light + pump controllable from the HA integration and `bin/` scripts (REST)
 > - [ ] Scheduler drives light/pump at the configured times; survives a reboot
 >       (restart catch-up verified)
-> - [ ] Water-low interlock blocks the pump from **every** path (MQTT, REST, button)
-> - [ ] Temperature, humidity, PCB temp, water level, pump power all publish
-> - [ ] Cameras publish to Home Assistant
-> - [ ] Over-temp binary sensor reflects the alert pin
+> - [ ] Water-low interlock blocks the pump from **every** path (REST, button, scheduler)
+> - [ ] Temperature, humidity, PCB temp, water level, pump power all present in `/state`
+> - [ ] Cameras return frames via `/camera/upper.jpg` and `/camera/lower.jpg`
+> - [ ] Over-temp reflected in `/state` (`overtemp`) from the alert pin
 > - [ ] Old `mqtt.service` stopped and disabled
 
 - [ ] **Step 1: Stop and disable the old unit on the Pi (manual)**

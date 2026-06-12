@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a runnable `gardynd` Go binary that controls a (mock) light and pump end-to-end over both REST and MQTT, publishing Home Assistant discovery + availability — the skeleton every later plan extends.
+**Goal:** Build a runnable REST-only `gardynd` Go binary that controls a (mock) light and pump and serves a `GET /state` snapshot — the skeleton every later plan extends.
 
-**Architecture:** A single-writer `core` goroutine owns all device state; MQTT and REST handlers submit commands over a channel. Hardware sits behind interfaces with an in-memory mock so the whole service runs on a laptop via `--hw=mock`. MQTT uses HA MQTT discovery with a Last-Will availability topic.
+**Architecture:** A single-writer `core` goroutine owns all device state; REST handlers submit commands over a channel. After applying each command the core writes values into a thread-safe snapshot store that `GET /state` serializes. Hardware sits behind interfaces with an in-memory mock so the whole service runs on a laptop via `--hw=mock`. No MQTT — Home Assistant connects later through the dedicated integration that polls this API.
 
-**Tech Stack:** Go (ARMv6 target, `CGO_ENABLED=0`), `gopkg.in/yaml.v3`, `github.com/eclipse/paho.mqtt.golang`, `github.com/mochi-mqtt/server` (test-only embedded broker), stdlib `net/http`.
+**Tech Stack:** Go (ARMv6 target, `CGO_ENABLED=0`), `gopkg.in/yaml.v3`, stdlib `net/http`.
 
 **Spec:** `docs/superpowers/specs/2026-06-12-gardynd-go-service-design.md`
 
@@ -23,15 +23,13 @@ Makefile
 **internal/hw/hw.go**              driver interfaces (Light, Pump, + later sensors)
 **internal/hw/mock/mock.go**       in-memory fakes
 **internal/hw/mock/mock_test.go**
+**internal/state/state.go**        thread-safe snapshot store
+**internal/state/state_test.go**
 **internal/core/core.go**          single-writer state machine
 **internal/core/core_test.go**
-**internal/mqttsvc/discovery.go**  HA discovery payload builders
-**internal/mqttsvc/discovery_test.go**
-**internal/mqttsvc/mqttsvc.go**    paho client, subscribe/dispatch, publish, LWT
-**internal/mqttsvc/mqttsvc_test.go**
-**internal/httpapi/httpapi.go**    REST handlers
+**internal/httpapi/httpapi.go**    REST handlers (control + /state + /healthz)
 **internal/httpapi/httpapi_test.go**
- internal/hw/light.go ...          (Plan 2: real drivers)
+ internal/hw/real/...              (Plan 2: real drivers)
  internal/core/scheduler.go        (Plan 3)
 ```
 
@@ -46,7 +44,7 @@ Module path: `github.com/iot-root/garden-of-eden`.
 **Files:**
 - Create: `go.mod`
 - Create: `Makefile`
-- Create: `cmd/gardynd/main.go` (temporary stub, replaced in Task 8)
+- Create: `cmd/gardynd/main.go` (temporary stub, replaced in Task 7)
 
 - [ ] **Step 1: Initialize the module**
 
@@ -54,10 +52,8 @@ Run:
 ```
 go mod init github.com/iot-root/garden-of-eden
 go get gopkg.in/yaml.v3@v3.0.1
-go get github.com/eclipse/paho.mqtt.golang@v1.5.0
-go get github.com/mochi-mqtt/server/v2@v2.6.6
 ```
-Expected: `go.mod` created and the three requires added.
+Expected: `go.mod` created with the yaml require.
 
 - [ ] **Step 2: Create a temporary main so the module builds**
 
@@ -108,7 +104,7 @@ Expected: `bin/gardynd` produced, no errors.
 
 Config loads from a YAML file, then applies environment-variable overrides so
 the existing `.env` keys keep working during migration (parity with
-`config.py`).
+`config.py`). No MQTT credentials — those are gone.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -127,42 +123,32 @@ func TestLoadDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(\"\"): %v", err)
 	}
-	if c.MQTT.Broker != "localhost" || c.MQTT.Port != 1883 {
-		t.Errorf("broker defaults = %s:%d", c.MQTT.Broker, c.MQTT.Port)
-	}
-	if c.Device.BaseTopic != "gardyn" || c.Device.Identifier != "gardyn-xx" {
-		t.Errorf("device defaults = %q / %q", c.Device.BaseTopic, c.Device.Identifier)
-	}
 	if c.HTTP.Port != 5000 {
 		t.Errorf("http port default = %d", c.HTTP.Port)
+	}
+	if c.Device.Identifier != "gardyn-xx" {
+		t.Errorf("identifier default = %q", c.Device.Identifier)
 	}
 }
 
 func TestFileThenEnvOverride(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
-	yaml := "mqtt:\n  broker: filebroker\n  port: 1900\ndevice:\n  identifier: gardyn-01\n"
+	yaml := "http:\n  port: 5050\ndevice:\n  identifier: gardyn-01\n"
 	if err := os.WriteFile(path, []byte(yaml), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("MQTT_BROKER", "envbroker")
-	t.Setenv("MQTT_BASETOPIC", "garden2")
+	t.Setenv("MQTT_IDENTIFIER", "gardyn-env") // legacy env key still recognized
 
 	c, err := Load(path)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if c.MQTT.Broker != "envbroker" { // env wins over file
-		t.Errorf("broker = %q, want envbroker", c.MQTT.Broker)
+	if c.HTTP.Port != 5050 { // file wins over default
+		t.Errorf("port = %d, want 5050", c.HTTP.Port)
 	}
-	if c.MQTT.Port != 1900 { // file wins over default
-		t.Errorf("port = %d, want 1900", c.MQTT.Port)
-	}
-	if c.Device.Identifier != "gardyn-01" {
-		t.Errorf("identifier = %q, want gardyn-01", c.Device.Identifier)
-	}
-	if c.Device.BaseTopic != "garden2" {
-		t.Errorf("base topic = %q, want garden2", c.Device.BaseTopic)
+	if c.Device.Identifier != "gardyn-env" { // env wins over file
+		t.Errorf("identifier = %q, want gardyn-env", c.Device.Identifier)
 	}
 }
 ```
@@ -188,36 +174,25 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-type MQTTConfig struct {
-	Broker    string `yaml:"broker"`
-	Port      int    `yaml:"port"`
-	Username  string `yaml:"username"`
-	Password  string `yaml:"password"`
-	KeepAlive int    `yaml:"keepalive"`
-}
-
 type HTTPConfig struct {
 	Port int `yaml:"port"`
 }
 
 type DeviceConfig struct {
-	BaseTopic  string `yaml:"base_topic"`
 	Identifier string `yaml:"identifier"`
 	Model      string `yaml:"model"`
 	Version    string `yaml:"version"`
 }
 
 type Config struct {
-	MQTT   MQTTConfig   `yaml:"mqtt"`
 	HTTP   HTTPConfig   `yaml:"http"`
 	Device DeviceConfig `yaml:"device"`
 }
 
 func defaults() Config {
 	return Config{
-		MQTT:   MQTTConfig{Broker: "localhost", Port: 1883, KeepAlive: 60},
 		HTTP:   HTTPConfig{Port: 5000},
-		Device: DeviceConfig{BaseTopic: "gardyn", Identifier: "gardyn-xx", Model: "gardyn 3.0", Version: "1.0.0"},
+		Device: DeviceConfig{Identifier: "gardyn-xx", Model: "gardyn 3.0", Version: "1.0.0"},
 	}
 }
 
@@ -239,13 +214,8 @@ func Load(path string) (Config, error) {
 }
 
 func applyEnv(c *Config) {
-	envStr(&c.MQTT.Broker, "MQTT_BROKER")
-	envInt(&c.MQTT.Port, "MQTT_PORT")
-	envInt(&c.MQTT.KeepAlive, "MQTT_KEEPALIVE_INTERVAL")
-	envStr(&c.MQTT.Username, "MQTT_USERNAME")
-	envStr(&c.MQTT.Password, "MQTT_PASSWORD")
-	envStr(&c.Device.BaseTopic, "MQTT_BASETOPIC")
-	envStr(&c.Device.Identifier, "MQTT_IDENTIFIER")
+	envInt(&c.HTTP.Port, "HTTP_PORT")
+	envStr(&c.Device.Identifier, "MQTT_IDENTIFIER") // legacy key name retained
 	envStr(&c.Device.Model, "MQTT_DEVICE_MODEL")
 	envStr(&c.Device.Version, "MQTT_VERSION")
 }
@@ -303,8 +273,7 @@ type Pump interface {
 	Off() error
 }
 
-// Devices bundles the hardware the core controls. Later plans add sensor
-// fields (distance, env, pcb temp, power, camera, button).
+// Devices bundles the hardware the core controls. Later plans add sensor fields.
 type Devices struct {
 	Light Light
 	Pump  Pump
@@ -418,17 +387,205 @@ Expected: PASS.
 
 ---
 
-### Task 4: Core single-writer state machine
+### Task 4: Snapshot store
 
-**Depends on:** Task 3 (consumes `hw.Devices`)
+**Depends on:** Task 1
+
+**Files:**
+- Create: `internal/state/state.go`
+- Test: `internal/state/state_test.go`
+
+A thread-safe store the core writes to and `GET /state` serializes. Fields are
+pointers where "absent" must be distinguishable from zero (sensors), so the HA
+integration can map `null` to unavailable.
+
+- [ ] **Step 1: Write the failing test**
+
+`internal/state/state_test.go`:
+```go
+package state
+
+import (
+	"encoding/json"
+	"testing"
+)
+
+func TestStoreSnapshotJSON(t *testing.T) {
+	s := New()
+	s.SetLight(true, 70)
+	s.SetPump(false, 100)
+
+	b, err := json.Marshal(s.Snapshot())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(b, &got); err != nil {
+		t.Fatal(err)
+	}
+	light := got["light"].(map[string]any)
+	if light["on"] != true || light["brightness"].(float64) != 70 {
+		t.Errorf("light = %v", light)
+	}
+	if got["available"] != true {
+		t.Errorf("available = %v", got["available"])
+	}
+}
+
+func TestConcurrentWrites(t *testing.T) {
+	s := New()
+	done := make(chan struct{})
+	go func() {
+		for i := 0; i < 1000; i++ {
+			s.SetLight(true, i%101)
+		}
+		close(done)
+	}()
+	for i := 0; i < 1000; i++ {
+		_ = s.Snapshot()
+	}
+	<-done
+}
+```
+
+- [ ] **Step 2: Run test to verify it fails**
+
+Run: `go test ./internal/state/ -v`
+Expected: build failure — `undefined: New`.
+
+- [ ] **Step 3: Implement the store**
+
+`internal/state/state.go`:
+```go
+// Package state holds the thread-safe device snapshot served by GET /state.
+package state
+
+import (
+	"sync"
+	"time"
+)
+
+type LightState struct {
+	On         bool `json:"on"`
+	Brightness int  `json:"brightness"`
+}
+
+type PumpState struct {
+	On    bool `json:"on"`
+	Speed int  `json:"speed"`
+}
+
+type PumpPower struct {
+	BusVoltage float64 `json:"bus_voltage"`
+	Current    float64 `json:"current"`
+	Power      float64 `json:"power"`
+}
+
+// Sensors uses pointers so an absent/failed sensor serializes as null.
+type Sensors struct {
+	TemperatureC *float64   `json:"temperature_c"`
+	HumidityPct  *float64   `json:"humidity_pct"`
+	PCBTempC     *float64   `json:"pcb_temp_c"`
+	WaterLevelCM *float64   `json:"water_level_cm"`
+	Pump         *PumpPower `json:"pump"`
+}
+
+type WaterState struct {
+	LowThresholdCM float64 `json:"low_threshold_cm"`
+	Low            bool    `json:"low"`
+}
+
+type Snapshot struct {
+	Available bool                  `json:"available"`
+	UptimeS   int64                 `json:"uptime_s"`
+	Light     LightState            `json:"light"`
+	Pump      PumpState             `json:"pump"`
+	Sensors   Sensors               `json:"sensors"`
+	Water     WaterState            `json:"water"`
+	OverTemp  bool                  `json:"overtemp"`
+	Schedules map[string]SchedFlag  `json:"schedules"`
+}
+
+type SchedFlag struct {
+	Enabled bool `json:"enabled"`
+}
+
+type Store struct {
+	mu    sync.RWMutex
+	start time.Time
+	snap  Snapshot
+}
+
+func New() *Store {
+	return &Store{
+		start: time.Now(),
+		snap: Snapshot{
+			Available: true,
+			Schedules: map[string]SchedFlag{"light": {}, "pump": {}},
+		},
+	}
+}
+
+// Snapshot returns a copy with a freshly-computed uptime.
+func (s *Store) Snapshot() Snapshot {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snap := s.snap
+	snap.UptimeS = int64(time.Since(s.start).Seconds())
+	return snap
+}
+
+func (s *Store) SetLight(on bool, brightness int) {
+	s.mu.Lock()
+	s.snap.Light = LightState{On: on, Brightness: brightness}
+	s.mu.Unlock()
+}
+
+func (s *Store) SetPump(on bool, speed int) {
+	s.mu.Lock()
+	s.snap.Pump = PumpState{On: on, Speed: speed}
+	s.mu.Unlock()
+}
+
+func (s *Store) SetWater(thresholdCM float64, low bool) {
+	s.mu.Lock()
+	s.snap.Water = WaterState{LowThresholdCM: thresholdCM, Low: low}
+	s.mu.Unlock()
+}
+
+func (s *Store) SetOverTemp(v bool) { s.mu.Lock(); s.snap.OverTemp = v; s.mu.Unlock() }
+
+func (s *Store) SetScheduleEnabled(channel string, enabled bool) {
+	s.mu.Lock()
+	s.snap.Schedules[channel] = SchedFlag{Enabled: enabled}
+	s.mu.Unlock()
+}
+
+// Sensor setters (used by Plan 3 publishers).
+func (s *Store) SetTemperature(c float64)  { s.mu.Lock(); s.snap.Sensors.TemperatureC = &c; s.mu.Unlock() }
+func (s *Store) SetHumidity(p float64)     { s.mu.Lock(); s.snap.Sensors.HumidityPct = &p; s.mu.Unlock() }
+func (s *Store) SetPCBTemp(c float64)      { s.mu.Lock(); s.snap.Sensors.PCBTempC = &c; s.mu.Unlock() }
+func (s *Store) SetWaterLevel(cm float64)  { s.mu.Lock(); s.snap.Sensors.WaterLevelCM = &cm; s.mu.Unlock() }
+func (s *Store) SetPumpPower(p PumpPower)  { s.mu.Lock(); s.snap.Sensors.Pump = &p; s.mu.Unlock() }
+```
+
+- [ ] **Step 4: Run test to verify it passes**
+
+Run: `go test ./internal/state/ -race -v`
+Expected: PASS (no data races).
+
+---
+
+### Task 5: Core single-writer state machine
+
+**Depends on:** Task 3 (`hw.Devices`), Task 4 (`*state.Store`)
 
 **Files:**
 - Create: `internal/core/core.go`
 - Test: `internal/core/core_test.go`
 
-The core owns all state. Inputs submit `Command`s; the core applies them to
-hardware, updates state, and emits `StateChange` events through a publish
-callback that MQTT/other consumers subscribe to.
+The core owns all mutation. Inputs submit `Command`s; the core applies them to
+hardware and writes results into the snapshot store.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -441,54 +598,49 @@ import (
 	"time"
 
 	"github.com/iot-root/garden-of-eden/internal/hw/mock"
+	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
-func drain(ch <-chan StateChange, n int, d time.Duration) []StateChange {
-	var out []StateChange
-	deadline := time.After(d)
-	for len(out) < n {
-		select {
-		case s := <-ch:
-			out = append(out, s)
-		case <-deadline:
-			return out
+func waitLight(st *state.Store, want int) bool {
+	for i := 0; i < 50; i++ {
+		if st.Snapshot().Light.Brightness == want {
+			return true
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	return out
+	return false
 }
 
-func TestLightOnPublishesState(t *testing.T) {
-	c := New(mock.New())
-	events := c.Subscribe()
+func TestLightOnUpdatesSnapshot(t *testing.T) {
+	st := state.New()
+	c := New(mock.New(), st)
 	go c.Run()
 	defer c.Stop()
 
 	c.Submit(Command{Target: TargetLight, Action: ActionOn, Value: 70})
 
-	got := drain(events, 2, time.Second)
-	want := map[string]string{"light/state": "ON", "light/brightness/state": "70"}
-	seen := map[string]string{}
-	for _, s := range got {
-		seen[s.Topic] = s.Payload
+	if !waitLight(st, 70) {
+		t.Errorf("light brightness not 70; snapshot=%+v", st.Snapshot().Light)
 	}
-	for k, v := range want {
-		if seen[k] != v {
-			t.Errorf("event %q = %q, want %q (all: %v)", k, seen[k], v, seen)
-		}
+	if !st.Snapshot().Light.On {
+		t.Error("light.on not true")
 	}
 }
 
-func TestPumpOffPublishesState(t *testing.T) {
-	c := New(mock.New())
-	events := c.Subscribe()
+func TestPumpOffUpdatesSnapshot(t *testing.T) {
+	st := state.New()
+	c := New(mock.New(), st)
 	go c.Run()
 	defer c.Stop()
 
 	c.Submit(Command{Target: TargetPump, Action: ActionOff})
-	got := drain(events, 1, time.Second)
-	if len(got) == 0 || got[0].Topic != "pump/state" || got[0].Payload != "OFF" {
-		t.Errorf("got %v, want pump/state OFF", got)
+	for i := 0; i < 50; i++ {
+		if !st.Snapshot().Pump.On {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Error("pump.on stayed true")
 }
 ```
 
@@ -502,14 +654,15 @@ Expected: build failure — `undefined: New`.
 `internal/core/core.go`:
 ```go
 // Package core is the single-writer state machine. All hardware mutation goes
-// through one goroutine; inputs submit Commands and observe StateChanges.
+// through one goroutine; inputs submit Commands and the core writes results to
+// the snapshot store.
 package core
 
 import (
 	"log"
-	"strconv"
 
 	"github.com/iot-root/garden-of-eden/internal/hw"
+	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
 type Target int
@@ -527,34 +680,25 @@ const (
 	ActionSetLevel // Value is the new brightness/speed percent
 )
 
-// Command is a request to mutate a device. Value is used by ActionOn (optional
-// level) and ActionSetLevel.
 type Command struct {
 	Target Target
 	Action Action
 	Value  int
 }
 
-// StateChange is emitted after a command is applied. Topic is relative to the
-// device base topic (e.g. "light/state"); the MQTT layer prefixes it.
-type StateChange struct {
-	Topic   string
-	Payload string
-}
-
 type Core struct {
-	dev    hw.Devices
-	cmds   chan Command
-	subs   []chan StateChange
-	done   chan struct{}
-	// last commanded levels, so ActionOn restores a sensible brightness/speed
+	dev        hw.Devices
+	store      *state.Store
+	cmds       chan Command
+	done       chan struct{}
 	lightLevel int
 	pumpLevel  int
 }
 
-func New(dev hw.Devices) *Core {
+func New(dev hw.Devices, store *state.Store) *Core {
 	return &Core{
 		dev:        dev,
+		store:      store,
 		cmds:       make(chan Command, 16),
 		done:       make(chan struct{}),
 		lightLevel: 50,
@@ -562,18 +706,8 @@ func New(dev hw.Devices) *Core {
 	}
 }
 
-// Subscribe returns a channel of state changes. Call before Run.
-func (c *Core) Subscribe() <-chan StateChange {
-	ch := make(chan StateChange, 32)
-	c.subs = append(c.subs, ch)
-	return ch
-}
-
-// Submit enqueues a command (non-blocking up to the buffer).
 func (c *Core) Submit(cmd Command) { c.cmds <- cmd }
-
-// Stop terminates the Run loop.
-func (c *Core) Stop() { close(c.done) }
+func (c *Core) Stop()              { close(c.done) }
 
 func (c *Core) Run() {
 	for {
@@ -605,21 +739,20 @@ func (c *Core) applyLight(cmd Command) {
 			log.Printf("light on: %v", err)
 			return
 		}
-		c.emit("light/state", "ON")
-		c.emit("light/brightness/state", strconv.Itoa(c.lightLevel))
+		c.store.SetLight(true, c.lightLevel)
 	case ActionOff:
 		if err := c.dev.Light.Off(); err != nil {
 			log.Printf("light off: %v", err)
 			return
 		}
-		c.emit("light/state", "OFF")
+		c.store.SetLight(false, c.lightLevel)
 	case ActionSetLevel:
 		c.lightLevel = cmd.Value
 		if err := c.dev.Light.SetBrightness(cmd.Value); err != nil {
 			log.Printf("light level: %v", err)
 			return
 		}
-		c.emit("light/brightness/state", strconv.Itoa(cmd.Value))
+		c.store.SetLight(cmd.Value > 0, cmd.Value)
 	}
 }
 
@@ -633,512 +766,38 @@ func (c *Core) applyPump(cmd Command) {
 			log.Printf("pump on: %v", err)
 			return
 		}
-		c.emit("pump/state", "ON")
-		c.emit("pump/speed/state", strconv.Itoa(c.pumpLevel))
+		c.store.SetPump(true, c.pumpLevel)
 	case ActionOff:
 		if err := c.dev.Pump.Off(); err != nil {
 			log.Printf("pump off: %v", err)
 			return
 		}
-		c.emit("pump/state", "OFF")
+		c.store.SetPump(false, c.pumpLevel)
 	case ActionSetLevel:
 		c.pumpLevel = cmd.Value
 		if err := c.dev.Pump.SetSpeed(cmd.Value); err != nil {
 			log.Printf("pump level: %v", err)
 			return
 		}
-		c.emit("pump/speed/state", strconv.Itoa(cmd.Value))
-	}
-}
-
-func (c *Core) emit(topic, payload string) {
-	for _, ch := range c.subs {
-		select {
-		case ch <- StateChange{Topic: topic, Payload: payload}:
-		default: // never block the writer on a slow consumer
-		}
+		c.store.SetPump(cmd.Value > 0, cmd.Value)
 	}
 }
 ```
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `go test ./internal/core/ -v`
+Run: `go test ./internal/core/ -race -v`
 Expected: PASS.
 
 ---
 
-### Task 5: MQTT discovery payload builders
+### Task 6: REST API — control + `/state` + `/healthz`
 
-**Depends on:** Task 2 (consumes `config.DeviceConfig`)
-
-**Files:**
-- Create: `internal/mqttsvc/discovery.go`
-- Test: `internal/mqttsvc/discovery_test.go`
-
-Pure functions that build the HA discovery topic + JSON for each entity. Topics
-and `unique_id`s MUST match the current Python output; we additionally set
-`availability_topic` (new in this rewrite).
-
-- [ ] **Step 1: Write the failing test**
-
-`internal/mqttsvc/discovery_test.go`:
-```go
-package mqttsvc
-
-import (
-	"encoding/json"
-	"testing"
-
-	"github.com/iot-root/garden-of-eden/internal/config"
-)
-
-func dev() config.DeviceConfig {
-	return config.DeviceConfig{BaseTopic: "gardyn", Identifier: "gardyn-xx", Model: "gardyn 3.0", Version: "1.0.0"}
-}
-
-func TestLightDiscoveryTopicAndIDs(t *testing.T) {
-	msgs := DiscoveryMessages(dev())
-	m, ok := msgs["homeassistant/light/gardyn/gardyn-xx_light/config"]
-	if !ok {
-		t.Fatalf("light discovery topic missing; got %v", keys(msgs))
-	}
-	var p map[string]any
-	if err := json.Unmarshal(m, &p); err != nil {
-		t.Fatal(err)
-	}
-	if p["unique_id"] != "gardyn-xx_light" {
-		t.Errorf("unique_id = %v", p["unique_id"])
-	}
-	if p["state_topic"] != "gardyn/light/state" {
-		t.Errorf("state_topic = %v", p["state_topic"])
-	}
-	if p["command_topic"] != "gardyn/light/command" {
-		t.Errorf("command_topic = %v", p["command_topic"])
-	}
-	if p["brightness_command_topic"] != "gardyn/light/brightness/set" {
-		t.Errorf("brightness_command_topic = %v", p["brightness_command_topic"])
-	}
-	if p["availability_topic"] != "gardyn/availability" {
-		t.Errorf("availability_topic = %v", p["availability_topic"])
-	}
-}
-
-func TestPumpDiscoveryPresent(t *testing.T) {
-	msgs := DiscoveryMessages(dev())
-	m, ok := msgs["homeassistant/light/gardyn/gardyn-xx_pump/config"]
-	if !ok {
-		t.Fatalf("pump discovery topic missing; got %v", keys(msgs))
-	}
-	var p map[string]any
-	if err := json.Unmarshal(m, &p); err != nil {
-		t.Fatal(err)
-	}
-	if p["unique_id"] != "gardyn-xx_pump" {
-		t.Errorf("unique_id = %v", p["unique_id"])
-	}
-	if p["command_topic"] != "gardyn/pump/command" {
-		t.Errorf("command_topic = %v", p["command_topic"])
-	}
-}
-
-func keys(m map[string][]byte) []string {
-	out := make([]string, 0, len(m))
-	for k := range m {
-		out = append(out, k)
-	}
-	return out
-}
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `go test ./internal/mqttsvc/ -run Discovery -v`
-Expected: build failure — `undefined: DiscoveryMessages`.
-
-- [ ] **Step 3: Implement the builders**
-
-`internal/mqttsvc/discovery.go`:
-```go
-package mqttsvc
-
-import (
-	"encoding/json"
-
-	"github.com/iot-root/garden-of-eden/internal/config"
-)
-
-// AvailabilityTopic returns the LWT/availability topic for the device.
-func AvailabilityTopic(d config.DeviceConfig) string { return d.BaseTopic + "/availability" }
-
-func deviceInfo(d config.DeviceConfig) map[string]any {
-	return map[string]any{
-		"identifiers":  []string{d.Identifier},
-		"name":         d.BaseTopic,
-		"manufacturer": "gardyn-of-eden",
-		"model":        d.Model,
-		"sw_version":   d.Version,
-	}
-}
-
-// DiscoveryMessages returns a map of retained discovery topic -> JSON payload.
-// Plan 1 covers light + pump; later plans add sensors to this map.
-func DiscoveryMessages(d config.DeviceConfig) map[string][]byte {
-	base := d.BaseTopic
-	avail := AvailabilityTopic(d)
-	info := deviceInfo(d)
-	out := map[string][]byte{}
-
-	light := map[string]any{
-		"name":                      "Light",
-		"unique_id":                 d.Identifier + "_light",
-		"platform":                  "mqtt",
-		"state_topic":               base + "/light/state",
-		"command_topic":             base + "/light/command",
-		"brightness_state_topic":    base + "/light/brightness/state",
-		"brightness_command_topic":  base + "/light/brightness/set",
-		"brightness_scale":          100,
-		"availability_topic":        avail,
-		"device":                    info,
-	}
-	out["homeassistant/light/gardyn/"+d.Identifier+"_light/config"] = mustJSON(light)
-
-	pump := map[string]any{
-		"name":                     "Pump",
-		"unique_id":                d.Identifier + "_pump",
-		"platform":                 "mqtt",
-		"device_class":             "fan",
-		"state_topic":              base + "/pump/state",
-		"command_topic":            base + "/pump/command",
-		"brightness_state_topic":   base + "/pump/speed/state",
-		"brightness_command_topic": base + "/pump/speed/set",
-		"brightness_scale":         100,
-		"icon":                     "mdi:water-pump",
-		"availability_topic":       avail,
-		"device":                   info,
-	}
-	out["homeassistant/light/gardyn/"+d.Identifier+"_pump/config"] = mustJSON(pump)
-
-	return out
-}
-
-func mustJSON(v any) []byte {
-	b, err := json.Marshal(v)
-	if err != nil {
-		panic(err) // payloads are static maps; marshal cannot fail
-	}
-	return b
-}
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `go test ./internal/mqttsvc/ -run Discovery -v`
-Expected: PASS.
-
----
-
-### Task 6: MQTT client — connect, LWT, subscribe, dispatch, publish
-
-**Depends on:** Task 4 (core `Command`/`StateChange`), Task 5 (discovery)
-
-**Files:**
-- Create: `internal/mqttsvc/mqttsvc.go`
-- Test: `internal/mqttsvc/mqttsvc_test.go`
-
-Wires paho to the core: subscribes to `<base>/#`, maps command topics to core
-`Command`s, forwards core `StateChange`s to MQTT, sets a retained LWT on the
-availability topic, and publishes discovery on connect. The test runs a real
-in-process `mochi-mqtt` broker.
-
-- [ ] **Step 1: Write the failing integration test**
-
-`internal/mqttsvc/mqttsvc_test.go`:
-```go
-package mqttsvc
-
-import (
-	"fmt"
-	"net"
-	"sync"
-	"testing"
-	"time"
-
-	mqtt "github.com/eclipse/paho.mqtt.golang"
-	mochi "github.com/mochi-mqtt/server/v2"
-	"github.com/mochi-mqtt/server/v2/hooks/auth"
-	"github.com/mochi-mqtt/server/v2/listeners"
-
-	"github.com/iot-root/garden-of-eden/internal/config"
-	"github.com/iot-root/garden-of-eden/internal/core"
-	"github.com/iot-root/garden-of-eden/internal/hw/mock"
-)
-
-func startBroker(t *testing.T) string {
-	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	addr := ln.Addr().String()
-	ln.Close()
-
-	srv := mochi.New(nil)
-	_ = srv.AddHook(new(auth.AllowHook), nil)
-	tcp := listeners.NewTCP(listeners.Config{ID: "t", Address: addr})
-	if err := srv.AddListener(tcp); err != nil {
-		t.Fatal(err)
-	}
-	go func() { _ = srv.Serve() }()
-	t.Cleanup(func() { _ = srv.Close() })
-	time.Sleep(100 * time.Millisecond)
-	return addr
-}
-
-func subClient(t *testing.T, addr string) (mqtt.Client, *sync.Map) {
-	t.Helper()
-	host, port, _ := net.SplitHostPort(addr)
-	opts := mqtt.NewClientOptions().AddBroker(fmt.Sprintf("tcp://%s:%s", host, port)).SetClientID("probe")
-	got := &sync.Map{}
-	cl := mqtt.NewClient(opts)
-	if tok := cl.Connect(); tok.Wait() && tok.Error() != nil {
-		t.Fatal(tok.Error())
-	}
-	cl.Subscribe("#", 0, func(_ mqtt.Client, m mqtt.Message) {
-		got.Store(m.Topic(), string(m.Payload()))
-	})
-	return cl, got
-}
-
-func waitFor(got *sync.Map, topic, want string, d time.Duration) bool {
-	deadline := time.After(d)
-	for {
-		if v, ok := got.Load(topic); ok && v.(string) == want {
-			return true
-		}
-		select {
-		case <-deadline:
-			return false
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-}
-
-func TestDiscoveryPublishedOnConnect(t *testing.T) {
-	addr := startBroker(t)
-	probe, got := subClient(t, addr)
-	defer probe.Disconnect(100)
-
-	cfg := config.Config{Device: config.DeviceConfig{BaseTopic: "gardyn", Identifier: "gardyn-xx"}}
-	host, port, _ := net.SplitHostPort(addr)
-	cfg.MQTT.Broker, cfg.MQTT.Port = host, atoiHelper(port)
-
-	c := core.New(mock.New())
-	go c.Run()
-	defer c.Stop()
-
-	svc, err := New(cfg, c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer svc.Stop()
-
-	if !waitForExists(got, "homeassistant/light/gardyn/gardyn-xx_light/config", time.Second) {
-		t.Error("light discovery not published")
-	}
-	if !waitFor(got, "gardyn/availability", "online", time.Second) {
-		t.Error("availability online not published")
-	}
-}
-
-func TestCommandTopicDrivesState(t *testing.T) {
-	addr := startBroker(t)
-	probe, got := subClient(t, addr)
-	defer probe.Disconnect(100)
-
-	cfg := config.Config{Device: config.DeviceConfig{BaseTopic: "gardyn", Identifier: "gardyn-xx"}}
-	host, port, _ := net.SplitHostPort(addr)
-	cfg.MQTT.Broker, cfg.MQTT.Port = host, atoiHelper(port)
-
-	c := core.New(mock.New())
-	go c.Run()
-	defer c.Stop()
-	svc, err := New(cfg, c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer svc.Stop()
-
-	probe.Publish("gardyn/light/command", 0, false, "ON")
-	if !waitFor(got, "gardyn/light/state", "ON", time.Second) {
-		t.Error("light/state ON not published in response to command")
-	}
-}
-
-func waitForExists(got *sync.Map, topic string, d time.Duration) bool {
-	deadline := time.After(d)
-	for {
-		if _, ok := got.Load(topic); ok {
-			return true
-		}
-		select {
-		case <-deadline:
-			return false
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-}
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `go test ./internal/mqttsvc/ -run 'Discovery|Command' -v`
-Expected: build failure — `undefined: New` (the service constructor) and `undefined: atoiHelper`.
-
-- [ ] **Step 3: Implement the service**
-
-`internal/mqttsvc/mqttsvc.go`:
-```go
-package mqttsvc
-
-import (
-	"fmt"
-	"log"
-	"strconv"
-	"strings"
-
-	mqtt "github.com/eclipse/paho.mqtt.golang"
-
-	"github.com/iot-root/garden-of-eden/internal/config"
-	"github.com/iot-root/garden-of-eden/internal/core"
-)
-
-type Service struct {
-	cfg    config.Config
-	core   *core.Core
-	client mqtt.Client
-	base   string
-	done   chan struct{}
-}
-
-// atoiHelper is exported-for-tests style helper kept unexported but referenced
-// by tests in the same package.
-func atoiHelper(s string) int { n, _ := strconv.Atoi(s); return n }
-
-// New connects to the broker, sets the LWT, subscribes, publishes discovery,
-// and starts forwarding core state changes to MQTT.
-func New(cfg config.Config, c *core.Core) (*Service, error) {
-	s := &Service{cfg: cfg, core: c, base: cfg.Device.BaseTopic, done: make(chan struct{})}
-	avail := AvailabilityTopic(cfg.Device)
-
-	opts := mqtt.NewClientOptions().
-		AddBroker(fmt.Sprintf("tcp://%s:%d", cfg.MQTT.Broker, cfg.MQTT.Port)).
-		SetClientID("gardynd-" + cfg.Device.Identifier).
-		SetWill(avail, "offline", 1, true).
-		SetAutoReconnect(true).
-		SetOnConnectHandler(s.onConnect)
-	if cfg.MQTT.Username != "" {
-		opts.SetUsername(cfg.MQTT.Username).SetPassword(cfg.MQTT.Password)
-	}
-
-	s.client = mqtt.NewClient(opts)
-	if tok := s.client.Connect(); tok.Wait() && tok.Error() != nil {
-		return nil, fmt.Errorf("mqtt connect: %w", tok.Error())
-	}
-
-	stateCh := c.Subscribe()
-	go s.forwardState(stateCh)
-	return s, nil
-}
-
-func (s *Service) onConnect(client mqtt.Client) {
-	avail := AvailabilityTopic(s.cfg.Device)
-	client.Publish(avail, 1, true, "online")
-	for topic, payload := range DiscoveryMessages(s.cfg.Device) {
-		client.Publish(topic, 0, true, payload)
-	}
-	client.Subscribe(s.base+"/#", 0, s.onMessage)
-}
-
-func (s *Service) forwardState(ch <-chan core.StateChange) {
-	for {
-		select {
-		case <-s.done:
-			return
-		case sc := <-ch:
-			s.client.Publish(s.base+"/"+sc.Topic, 0, false, sc.Payload)
-		}
-	}
-}
-
-func (s *Service) onMessage(_ mqtt.Client, m mqtt.Message) {
-	suffix := strings.TrimPrefix(m.Topic(), s.base+"/")
-	payload := strings.TrimSpace(string(m.Payload()))
-	cmd, ok := mapCommand(suffix, payload)
-	if !ok {
-		return
-	}
-	s.core.Submit(cmd)
-}
-
-// mapCommand translates a command topic suffix + payload into a core.Command.
-func mapCommand(suffix, payload string) (core.Command, bool) {
-	up := strings.ToUpper(payload)
-	switch suffix {
-	case "light/command":
-		if up == "ON" {
-			return core.Command{Target: core.TargetLight, Action: core.ActionOn}, true
-		}
-		if up == "OFF" {
-			return core.Command{Target: core.TargetLight, Action: core.ActionOff}, true
-		}
-	case "light/brightness/set":
-		if n, err := strconv.Atoi(payload); err == nil {
-			return core.Command{Target: core.TargetLight, Action: core.ActionSetLevel, Value: n}, true
-		}
-	case "pump/command":
-		if up == "ON" {
-			return core.Command{Target: core.TargetPump, Action: core.ActionOn}, true
-		}
-		if up == "OFF" {
-			return core.Command{Target: core.TargetPump, Action: core.ActionOff}, true
-		}
-	case "pump/speed/set":
-		if n, err := strconv.Atoi(payload); err == nil {
-			return core.Command{Target: core.TargetPump, Action: core.ActionSetLevel, Value: n}, true
-		}
-	}
-	return core.Command{}, false
-}
-
-// Stop publishes offline and disconnects.
-func (s *Service) Stop() {
-	close(s.done)
-	if s.client != nil && s.client.IsConnected() {
-		s.client.Publish(AvailabilityTopic(s.cfg.Device), 1, true, "offline")
-		s.client.Disconnect(200)
-	}
-	log.Printf("mqtt service stopped")
-}
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `go test ./internal/mqttsvc/ -v`
-Expected: PASS (both discovery and command tests).
-
----
-
-### Task 7: REST API
-
-**Depends on:** Task 4 (submits core `Command`s)
+**Depends on:** Task 5 (core), Task 4 (store)
 
 **Files:**
 - Create: `internal/httpapi/httpapi.go`
 - Test: `internal/httpapi/httpapi_test.go`
-
-Preserves the Flask routes: `POST /light/on`, `POST /light/off`,
-`POST /light/brightness {"value":N}`, the pump equivalents, plus `/healthz`.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1147,112 +806,84 @@ Preserves the Flask routes: `POST /light/on`, `POST /light/off`,
 package httpapi
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/iot-root/garden-of-eden/internal/core"
 	"github.com/iot-root/garden-of-eden/internal/hw/mock"
+	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
-func TestLightOnRoute(t *testing.T) {
-	devs := mock.New()
-	c := core.New(devs)
+func newH(t *testing.T) (http.Handler, *state.Store, func()) {
+	st := state.New()
+	c := core.New(mock.New(), st)
 	go c.Run()
-	defer c.Stop()
-	h := Handler(c)
-
-	req := httptest.NewRequest(http.MethodPost, "/light/on", nil)
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
-	}
-	if !waitBrightness(devs, func(b int) bool { return b > 0 }) {
-		t.Error("light not turned on")
-	}
+	return Handler(c, st), st, c.Stop
 }
 
-func TestLightBrightnessRoute(t *testing.T) {
-	devs := mock.New()
-	c := core.New(devs)
-	go c.Run()
-	defer c.Stop()
-	h := Handler(c)
+func TestLightOnThenState(t *testing.T) {
+	h, st, stop := newH(t)
+	defer stop()
 
-	req := httptest.NewRequest(http.MethodPost, "/light/brightness", strings.NewReader(`{"value":42}`))
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/light/brightness", strings.NewReader(`{"value":42}`)))
 	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d", rec.Code)
+		t.Fatalf("brightness status = %d", rec.Code)
 	}
-	if !waitBrightness(devs, func(b int) bool { return b == 42 }) {
-		t.Error("brightness not set to 42")
+
+	// Poll /state until the command is applied.
+	var snap state.Snapshot
+	for i := 0; i < 50; i++ {
+		rec = httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/state", nil))
+		_ = json.Unmarshal(rec.Body.Bytes(), &snap)
+		if snap.Light.Brightness == 42 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	if snap.Light.Brightness != 42 {
+		t.Errorf("state light brightness = %d, want 42", snap.Light.Brightness)
+	}
+	_ = st
 }
 
 func TestHealthz(t *testing.T) {
-	c := core.New(mock.New())
-	go c.Run()
-	defer c.Stop()
+	h, _, stop := newH(t)
+	defer stop()
 	rec := httptest.NewRecorder()
-	Handler(c).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
 	if rec.Code != http.StatusOK {
 		t.Errorf("healthz status = %d", rec.Code)
 	}
 }
-```
 
-Add the polling helper in the same file:
-```go
-import "time"
-
-func waitBrightness(d interface{ Light interfaceLight }, pred func(int) bool) bool {
-	return false // replaced below
-}
-```
-
-> Implementation note for Step 3: instead of the placeholder above, the test
-> uses the concrete mock. Replace the helper with the version below that reads
-> the mock light directly.
-
-- [ ] **Step 2: Replace the helper with a working version**
-
-In `internal/httpapi/httpapi_test.go`, use:
-```go
-import (
-	"time"
-
-	"github.com/iot-root/garden-of-eden/internal/hw"
-)
-
-func waitBrightness(d hw.Devices, pred func(int) bool) bool {
-	for i := 0; i < 50; i++ {
-		if pred(d.Light.Brightness()) {
-			return true
-		}
-		time.Sleep(10 * time.Millisecond)
+func TestBadBrightnessRejected(t *testing.T) {
+	h, _, stop := newH(t)
+	defer stop()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/light/brightness", strings.NewReader(`{"value":150}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400", rec.Code)
 	}
-	return false
 }
 ```
-(Update the two call sites to pass `devs` of type `hw.Devices` — `mock.New()`
-already returns that type.)
 
-- [ ] **Step 3: Run test to verify it fails**
+- [ ] **Step 2: Run test to verify it fails**
 
 Run: `go test ./internal/httpapi/ -v`
 Expected: build failure — `undefined: Handler`.
 
-- [ ] **Step 4: Implement the handlers**
+- [ ] **Step 3: Implement the handlers**
 
 `internal/httpapi/httpapi.go`:
 ```go
-// Package httpapi exposes the REST control surface, submitting commands to the
-// core. It mirrors the original Flask routes.
+// Package httpapi exposes the REST control + state surface, submitting commands
+// to the core and serving the snapshot store.
 package httpapi
 
 import (
@@ -1260,11 +891,22 @@ import (
 	"net/http"
 
 	"github.com/iot-root/garden-of-eden/internal/core"
+	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
-// Handler builds the REST mux bound to the given core.
-func Handler(c *core.Core) http.Handler {
+// Handler builds the REST mux. Plan 3 extends it (schedules, sensors, cameras)
+// via baseMux.
+func Handler(c *core.Core, st *state.Store) http.Handler { return baseMux(c, st) }
+
+func baseMux(c *core.Core, st *state.Store) *http.ServeMux {
 	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /state", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, st.Snapshot())
+	})
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
 
 	mux.HandleFunc("POST /light/on", func(w http.ResponseWriter, _ *http.Request) {
 		c.Submit(core.Command{Target: core.TargetLight, Action: core.ActionOn})
@@ -1286,9 +928,6 @@ func Handler(c *core.Core) http.Handler {
 	})
 	mux.HandleFunc("POST /pump/speed", levelHandler(c, core.TargetPump))
 
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
 	return mux
 }
 
@@ -1317,16 +956,16 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 ```
 
-- [ ] **Step 5: Run test to verify it passes**
+- [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/httpapi/ -v`
 Expected: PASS.
 
 ---
 
-### Task 8: Wire `main`, run full suite, single commit
+### Task 7: Wire `main`, run full suite, single commit
 
-**Depends on:** Tasks 2, 3, 4, 5, 6, 7
+**Depends on:** Tasks 2, 3, 4, 5, 6
 
 **Files:**
 - Modify: `cmd/gardynd/main.go` (replace the Task 1 stub)
@@ -1351,17 +990,21 @@ import (
 	"github.com/iot-root/garden-of-eden/internal/httpapi"
 	"github.com/iot-root/garden-of-eden/internal/hw"
 	"github.com/iot-root/garden-of-eden/internal/hw/mock"
-	"github.com/iot-root/garden-of-eden/internal/mqttsvc"
+	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
 func main() {
 	configPath := flag.String("config", "", "path to YAML config file")
 	hwMode := flag.String("hw", "real", "hardware backend: real|mock")
+	httpPort := flag.Int("http-port", 0, "override HTTP port (0 = use config)")
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
 		log.Fatalf("config: %v", err)
+	}
+	if *httpPort != 0 {
+		cfg.HTTP.Port = *httpPort
 	}
 
 	var devs hw.Devices
@@ -1374,18 +1017,13 @@ func main() {
 		log.Fatalf("unknown --hw value %q", *hwMode)
 	}
 
-	c := core.New(devs)
+	st := state.New()
+	c := core.New(devs, st)
 	go c.Run()
 	defer c.Stop()
 
-	svc, err := mqttsvc.New(cfg, c)
-	if err != nil {
-		log.Fatalf("mqtt: %v", err)
-	}
-	defer svc.Stop()
-
 	addr := fmt.Sprintf(":%d", cfg.HTTP.Port)
-	server := &http.Server{Addr: addr, Handler: httpapi.Handler(c)}
+	server := &http.Server{Addr: addr, Handler: httpapi.Handler(c, st)}
 	go func() {
 		log.Printf("REST listening on %s", addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -1400,66 +1038,48 @@ func main() {
 }
 ```
 
-- [ ] **Step 2: Tidy modules**
+- [ ] **Step 2: Tidy, build (host + Pi), full suite**
 
-Run: `make tidy`
-Expected: `go.mod`/`go.sum` updated, no errors.
+Run: `make tidy && make build && make build-pi && go test ./... -race`
+Expected: both binaries build; all tests PASS, no races.
 
-- [ ] **Step 3: Build for host and for the Pi**
+- [ ] **Step 3: Manual smoke (optional)**
 
-Run: `make build && make build-pi`
-Expected: `bin/gardynd` and `bin/gardynd-armv6` produced.
+Run `./bin/gardynd --hw=mock`, then:
+`curl -X POST localhost:5000/light/brightness -d '{"value":70}'` and
+`curl localhost:5000/state` — confirm `light.brightness` is 70.
 
-- [ ] **Step 4: Run the full test suite**
-
-Run: `go test ./...`
-Expected: all packages PASS.
-
-- [ ] **Step 5: Manual smoke (optional but recommended)**
-
-Run: `./bin/gardynd --hw=mock` against a local mosquitto, then in another shell:
-`curl -X POST localhost:5000/light/on` and confirm `gardyn/light/state ON`
-appears (e.g. `mosquitto_sub -t 'gardyn/#'`).
-
-- [ ] **Step 6: Commit (single commit for the whole plan)**
+- [ ] **Step 4: Commit (single commit for the whole plan)**
 
 Run:
 ```
 git add go.mod go.sum Makefile cmd/ internal/
-git commit -m "feat: gardynd skeleton — light+pump over REST+MQTT with HA discovery"
+git commit -m "feat: gardynd skeleton — REST control + /state snapshot (light, pump)"
 ```
-Expected: one commit containing all Plan 1 changes.
 
 ---
 
 ## Self-Review
 
 **Spec coverage (Plan 1 portion):** single binary scaffold ✓; mock backend /
-`--hw=mock` laptop dev loop ✓; single-writer core ✓; REST parity for
-light+pump ✓; MQTT discovery with preserved topics/`unique_id`s ✓; availability
-LWT ✓; embedded-broker integration test ✓; ARMv6 cross-compile target ✓.
-Deferred by design to later plans: real drivers (Plan 2); scheduler,
-water-low interlock, over-temp, pump failsafe, sensors, camera, button (Plan
-3); systemd/CI/README/Python removal (Plan 4). No Plan-1 requirement is
-unaddressed.
+`--hw=mock` laptop dev loop ✓; single-writer core ✓; snapshot store + `GET /state`
+✓; REST control for light+pump ✓; `/healthz` ✓; ARMv6 cross-compile ✓; no MQTT
+✓. Deferred by design: real drivers (Plan 2); scheduler, interlocks, sensors,
+publishers, `/schedules`, `/camera`, zeroconf (Plan 3); systemd/CI/README/Python
+removal (Plan 4). No Plan-1 requirement is unaddressed.
 
-**Placeholder scan:** Task 7 Step 1 intentionally shows a placeholder helper
-that Step 2 replaces with the real version — flagged inline so the executor
-doesn't ship it. No other placeholders.
+**Placeholder scan:** None. The `case "real"` fatal is an intentional guard until
+Plan 2, not a placeholder.
 
-**Type consistency:** `hw.Devices{Light, Pump}`, `core.Command{Target, Action,
-Value}`, `core.StateChange{Topic, Payload}`, `core.New(hw.Devices)`,
-`mqttsvc.New(config.Config, *core.Core)`, `httpapi.Handler(*core.Core)`,
-`DiscoveryMessages(config.DeviceConfig)`, `AvailabilityTopic(config.DeviceConfig)`
-are used consistently across tasks. State topics emitted by core
-(`light/state`, `light/brightness/state`, `pump/state`, `pump/speed/state`) are
-prefixed with `<base>/` by `forwardState`, matching the discovery topics.
+**Type consistency:** `hw.Devices{Light, Pump}`, `state.New() *Store` with
+`SetLight/SetPump/Snapshot`, `core.New(hw.Devices, *state.Store)`,
+`core.Command{Target, Action, Value}`, `httpapi.Handler(*core.Core, *state.Store)`
++ `baseMux` are used consistently across tasks and main. The snapshot JSON shape
+matches the spec §4.1.
 
-**Dependency audit:** Task 1 (none) creates the module/stub. Tasks 2 and 3 both
-depend only on Task 1 and touch disjoint files (`internal/config` vs
-`internal/hw`) → safe to parallelize. Task 5 depends on Task 2 (uses
-`config.DeviceConfig`). Task 4 depends on Task 3. Task 6 depends on 4+5 (shares
-the `internal/mqttsvc` package with Task 5 — serialized correctly). Task 7
-depends on Task 4. Task 8 modifies `cmd/gardynd/main.go` (created in Task 1) and
-imports every package → depends on all. No `Depends on: none` task shares files
-with another. Audit clean.
+**Dependency audit:** Task 1 (none) creates the module/stub. Tasks 2, 3, 4 depend
+only on Task 1 and touch disjoint packages (`config`, `hw`, `state`) → safe to
+parallelize. Task 5 depends on Tasks 3+4 (uses both). Task 6 depends on Tasks
+4+5. Task 7 modifies `cmd/gardynd/main.go` (from Task 1) and imports every
+package → depends on all. No `Depends on: none` task shares files with another.
+Audit clean.

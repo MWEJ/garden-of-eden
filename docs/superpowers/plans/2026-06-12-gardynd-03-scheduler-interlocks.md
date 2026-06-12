@@ -2,14 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add the on-device behavior that makes gardynd a complete replacement: a state-based scheduler with restart catch-up, the water-low interlock enforced across every pump-on path, a pump max-runtime failsafe, the over-temp monitor, periodic sensor + camera publishers, and the remaining Home Assistant discovery entities.
+**Goal:** Add the behavior that makes gardynd a complete replacement: a state-based scheduler with restart catch-up, the water-low interlock across every pump-on path, a pump max-runtime failsafe, the over-temp monitor, periodic sensor reads into the snapshot store, camera JPEG serving, the schedule/water REST endpoints, and optional zeroconf discovery.
 
-**Architecture:** Behavior that touches device state stays in the single-writer `core`: the scheduler, interlock, and failsafe submit/observe through it. Publishers are independent goroutines that read sensors and emit `core.StateChange`-style MQTT messages. Schedule config persists atomically to the YAML file and is editable over REST.
+**Architecture:** Behavior touching device state stays in the single-writer `core`; the scheduler, interlock, and failsafe submit/observe through it and write results to the snapshot store. Sensor publishers are goroutines that read hardware and update the store. Cameras write their latest JPEG into a small frame buffer the REST layer serves. No MQTT.
 
-**Tech Stack:** Go stdlib `time`, `gopkg.in/yaml.v3` (atomic save), existing core/mqtt/httpapi packages.
+**Tech Stack:** Go stdlib `time`/`net/http`, `gopkg.in/yaml.v3` (atomic save), `github.com/grandcat/zeroconf` (optional mDNS).
 
 **Spec:** `docs/superpowers/specs/2026-06-12-gardynd-go-service-design.md`
-**Depends on:** Plan 1 (core, mqtt, httpapi, config) and Plan 2 (sensor interfaces on `hw.Devices`).
+**Depends on:** Plan 1 (core, state store, httpapi, config) and Plan 2 (sensor interfaces on `hw.Devices`, sensor REST routes).
 
 ---
 
@@ -19,18 +19,17 @@
 internal/config/config.go         MODIFY: schedule + water + overtemp config + atomic Save
 internal/config/schedule.go       schedule types + timeline evaluation (pure)
 internal/config/schedule_test.go
-internal/core/core.go             MODIFY: water-low interlock, pump failsafe, overtemp, schedule hooks
+internal/core/core.go             MODIFY: water-low interlock, pump failsafe, overtemp → store
 internal/core/core_test.go        MODIFY: interlock + failsafe tests
 internal/core/scheduler.go        scheduler goroutine (uses timeline eval)
 internal/core/scheduler_test.go
-internal/mqttsvc/discovery.go     MODIFY: sensor/water/camera/schedule-switch discovery
-internal/mqttsvc/discovery_test.go MODIFY
-internal/mqttsvc/mqttsvc.go       MODIFY: schedule-switch + water/low command handling
-internal/publish/publish.go       periodic sensor + camera publishers
+internal/state/frames.go          latest-JPEG frame buffer (cameras)
+internal/publish/publish.go       periodic sensor + camera reads into store/frames
 internal/publish/publish_test.go
-internal/httpapi/httpapi.go       MODIFY: /schedules CRUD
+internal/httpapi/httpapi.go       MODIFY: /schedules CRUD, schedule-enable, water threshold, /camera
 internal/httpapi/httpapi_test.go  MODIFY
-cmd/gardynd/main.go               MODIFY: start scheduler + publishers
+internal/discovery/discovery.go   optional zeroconf advertiser
+cmd/gardynd/main.go               MODIFY: start scheduler + publishers + discovery
 ```
 
 ---
@@ -43,10 +42,9 @@ cmd/gardynd/main.go               MODIFY: start scheduler + publishers
 - Create: `internal/config/schedule.go`
 - Test: `internal/config/schedule_test.go`
 
-The core insight from the spec: scheduling is **state-based**. Given a list of
-`{at, action, brightness}` entries and the current wall-clock time, compute the
-state the timeline implies *right now* (the most recent past entry, wrapping
-across midnight). This is what enables restart catch-up and is fully testable.
+Scheduling is **state-based**: given entries and the current time, compute the
+state the timeline implies *now* (the most recent past entry, wrapping
+midnight). This enables restart catch-up and is fully testable.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -84,18 +82,15 @@ func TestStateAtMidTimeline(t *testing.T) {
 }
 
 func TestMidnightWrap(t *testing.T) {
-	// Before the first entry of the day, state comes from the LAST entry
-	// (previous evening), wrapping midnight.
 	s := lightSched()
-	st, _ := s.StateAt(mins(2, 0)) // 02:00, before 06:00
+	st, _ := s.StateAt(mins(2, 0)) // before first entry => carried from 20:00 off
 	if st.On {
-		t.Errorf("02:00 => %+v, want off (carried from 20:00 off)", st)
+		t.Errorf("02:00 => %+v, want off", st)
 	}
 }
 
 func TestDueEntries(t *testing.T) {
 	s := lightSched()
-	// Entries that fire when crossing from 05:59 to 06:00.
 	due := s.DueBetween(mins(5, 59), mins(6, 0))
 	if len(due) != 1 || due[0].Action != "on" {
 		t.Errorf("due = %+v, want [on@06:00]", due)
@@ -122,28 +117,26 @@ import (
 )
 
 type ScheduleEntry struct {
-	At         string `yaml:"at"`     // "HH:MM"
-	Action     string `yaml:"action"` // "on" | "off"
-	Brightness int    `yaml:"brightness,omitempty"`
+	At         string `yaml:"at" json:"at"`         // "HH:MM"
+	Action     string `yaml:"action" json:"action"` // "on" | "off"
+	Brightness int    `yaml:"brightness,omitempty" json:"brightness,omitempty"`
 }
 
 type Schedule struct {
-	Enabled bool            `yaml:"enabled"`
-	Entries []ScheduleEntry `yaml:"entries"`
+	Enabled bool            `yaml:"enabled" json:"enabled"`
+	Entries []ScheduleEntry `yaml:"entries" json:"entries"`
 }
 
 type Schedules struct {
-	Light Schedule `yaml:"light"`
-	Pump  Schedule `yaml:"pump"`
+	Light Schedule `yaml:"light" json:"light"`
+	Pump  Schedule `yaml:"pump" json:"pump"`
 }
 
-// ChannelState is the on/off (+brightness) state a timeline implies.
 type ChannelState struct {
 	On         bool
 	Brightness int
 }
 
-// minutes parses "HH:MM" to minutes-since-midnight.
 func minutes(at string) (int, error) {
 	parts := strings.SplitN(at, ":", 2)
 	if len(parts) != 2 {
@@ -157,19 +150,16 @@ func minutes(at string) (int, error) {
 	return h*60 + m, nil
 }
 
-// sortedEntries returns entries with parsed minute marks, ascending.
-func (s Schedule) sortedEntries() []struct {
+type parsedEntry struct {
 	min   int
 	entry ScheduleEntry
-} {
-	type pe = struct {
-		min   int
-		entry ScheduleEntry
-	}
-	var out []pe
+}
+
+func (s Schedule) sortedEntries() []parsedEntry {
+	var out []parsedEntry
 	for _, e := range s.Entries {
 		if m, err := minutes(e.At); err == nil {
-			out = append(out, pe{m, e})
+			out = append(out, parsedEntry{m, e})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].min < out[j].min })
@@ -177,13 +167,11 @@ func (s Schedule) sortedEntries() []struct {
 }
 
 // StateAt returns the channel state implied at nowMin (minutes since midnight).
-// ok=false when there are no valid entries.
 func (s Schedule) StateAt(nowMin int) (ChannelState, bool) {
 	es := s.sortedEntries()
 	if len(es) == 0 {
 		return ChannelState{}, false
 	}
-	// Most recent entry at or before nowMin; if none today, wrap to the last.
 	idx := -1
 	for i, e := range es {
 		if e.min <= nowMin {
@@ -197,8 +185,7 @@ func (s Schedule) StateAt(nowMin int) (ChannelState, bool) {
 	return ChannelState{On: e.Action == "on", Brightness: e.Brightness}, true
 }
 
-// DueBetween returns entries whose time is in (prevMin, nowMin], handling the
-// normal forward case (no midnight wrap within a single tick).
+// DueBetween returns entries with time in (prevMin, nowMin].
 func (s Schedule) DueBetween(prevMin, nowMin int) []ScheduleEntry {
 	var out []ScheduleEntry
 	for _, e := range s.sortedEntries() {
@@ -254,10 +241,10 @@ Expected: build failure — `c.Save` undefined / `Schedules` field missing.
 
 - [ ] **Step 3: Extend Config and add Save**
 
-In `internal/config/config.go`, add fields to `Config`:
+Add to the `Config` struct:
 ```go
-	Schedules Schedules     `yaml:"schedules"`
-	Water     WaterConfig   `yaml:"water"`
+	Schedules Schedules      `yaml:"schedules"`
+	Water     WaterConfig    `yaml:"water"`
 	OverTemp  OverTempConfig `yaml:"overtemp"`
 ```
 Add types:
@@ -270,7 +257,7 @@ type OverTempConfig struct {
 	CutLight bool `yaml:"cut_light"`
 }
 ```
-In `applyEnv`, preserve the existing env knob:
+In `applyEnv`, preserve the legacy env knob:
 ```go
 	if v, ok := os.LookupEnv("WATER_LOW_CM"); ok && v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
@@ -278,21 +265,16 @@ In `applyEnv`, preserve the existing env knob:
 		}
 	}
 ```
-Add the atomic save (write temp file in same dir, then rename):
+Add the atomic save (temp file + rename, same dir):
 ```go
-import (
-	// add:
-	"path/filepath"
-)
+import "path/filepath"
 
-// Save writes the config to path atomically (temp file + rename).
 func (c Config) Save(path string) error {
 	data, err := yaml.Marshal(c)
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".config-*.yaml")
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.yaml")
 	if err != nil {
 		return err
 	}
@@ -317,7 +299,7 @@ Expected: PASS.
 
 ---
 
-### Task 3: Core — water-low interlock, pump failsafe, over-temp
+### Task 3: Core — water-low interlock, pump failsafe, over-temp (→ store)
 
 **Depends on:** Task 2, Plan 2 Task 1 (`hw.Devices` sensor fields)
 
@@ -325,45 +307,32 @@ Expected: PASS.
 - Modify: `internal/core/core.go`
 - Test: `internal/core/core_test.go` (append)
 
-The interlock must guard **every** pump-on (MQTT, REST, button, scheduler) —
-this is the single-writer's job. We also add a max-runtime failsafe and the
-over-temp reaction.
+The interlock guards **every** pump-on (REST, button, scheduler) — the
+single-writer's job. Results are written to the snapshot store.
 
 - [ ] **Step 1: Write the failing tests (append)**
 
 Append to `internal/core/core_test.go`:
 ```go
-import (
-	"github.com/iot-root/garden-of-eden/internal/config"
-	mockhw "github.com/iot-root/garden-of-eden/internal/hw/mock"
-)
+import mockhw "github.com/iot-root/garden-of-eden/internal/hw/mock"
 
 func TestPumpBlockedWhenWaterLow(t *testing.T) {
+	st := state.New()
 	devs := mockhw.New()
 	devs.Distance.(*mockhw.Distance).CM = 12.0 // > threshold => too low
-	c := New(devs)
+	c := New(devs, st)
 	c.SetWaterLowCM(10.0)
-	events := c.Subscribe()
 	go c.Run()
 	defer c.Stop()
 
 	c.Submit(Command{Target: TargetPump, Action: ActionOn})
+	time.Sleep(2 * time.Second) // flashLights takes ~1.8s
 
-	got := drain(events, 2, time.Second)
-	var pumpOn, waterLow bool
-	for _, s := range got {
-		if s.Topic == "pump/state" && s.Payload == "ON" {
-			pumpOn = true
-		}
-		if s.Topic == "water/low/state" && s.Payload == "ON" {
-			waterLow = true
-		}
-	}
-	if pumpOn {
+	if st.Snapshot().Pump.On {
 		t.Error("pump turned on despite low water")
 	}
-	if !waterLow {
-		t.Error("water/low/state ON not published")
+	if !st.Snapshot().Water.Low {
+		t.Error("water.low not set true")
 	}
 	if devs.Pump.(*mockhw.Pump).Speed() != 0 {
 		t.Error("pump hardware was driven")
@@ -371,48 +340,39 @@ func TestPumpBlockedWhenWaterLow(t *testing.T) {
 }
 
 func TestPumpAllowedWhenWaterOK(t *testing.T) {
+	st := state.New()
 	devs := mockhw.New()
 	devs.Distance.(*mockhw.Distance).CM = 5.0 // <= threshold => ok
-	c := New(devs)
+	c := New(devs, st)
 	c.SetWaterLowCM(10.0)
-	events := c.Subscribe()
 	go c.Run()
 	defer c.Stop()
 
 	c.Submit(Command{Target: TargetPump, Action: ActionOn})
-	got := drain(events, 2, time.Second)
-	on := false
-	for _, s := range got {
-		if s.Topic == "pump/state" && s.Payload == "ON" {
-			on = true
+	for i := 0; i < 50; i++ {
+		if st.Snapshot().Pump.On {
+			return
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
-	if !on {
-		t.Error("pump should have turned on")
-	}
+	t.Error("pump should have turned on")
 }
 
 func TestPumpFailsafeForcesOff(t *testing.T) {
-	devs := mockhw.New()
-	c := New(devs)
+	st := state.New()
+	c := New(mockhw.New(), st)
 	c.SetPumpMaxRuntime(50 * time.Millisecond)
-	events := c.Subscribe()
 	go c.Run()
 	defer c.Stop()
 
 	c.Submit(Command{Target: TargetPump, Action: ActionOn})
-	// Within ~50ms the failsafe should publish pump/state OFF.
-	deadline := time.After(time.Second)
-	for {
-		select {
-		case s := <-events:
-			if s.Topic == "pump/state" && s.Payload == "OFF" {
-				return // success
-			}
-		case <-deadline:
-			t.Fatal("failsafe did not turn pump off")
+	for i := 0; i < 100; i++ {
+		if !st.Snapshot().Pump.On {
+			return // failsafe turned it off
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Fatal("failsafe did not turn pump off")
 }
 ```
 
@@ -423,36 +383,31 @@ Expected: build failure — `SetWaterLowCM`/`SetPumpMaxRuntime` undefined.
 
 - [ ] **Step 3: Implement in core**
 
-In `internal/core/core.go`, extend the `Core` struct and `New`:
+Add fields + setters to `Core`/`New`:
 ```go
 import "time"
 
-// add fields:
-//   waterLowCM     float64
-//   pumpMaxRuntime time.Duration
-//   pumpTimer      *time.Timer
+// fields: waterLowCM float64; pumpMaxRuntime time.Duration; pumpTimer *time.Timer; cutLightOnOverTemp bool
 
-func (c *Core) SetWaterLowCM(cm float64)            { c.waterLowCM = cm }
-func (c *Core) SetPumpMaxRuntime(d time.Duration)   { c.pumpMaxRuntime = d }
+func (c *Core) SetWaterLowCM(cm float64) {
+	c.waterLowCM = cm
+	c.store.SetWater(cm, false)
+}
+func (c *Core) SetPumpMaxRuntime(d time.Duration)  { c.pumpMaxRuntime = d }
+func (c *Core) SetCutLightOnOverTemp(b bool)       { c.cutLightOnOverTemp = b }
+func (c *Core) waterLowEnabled() bool              { return c.waterLowCM > 0 }
 ```
-Add a config setter used by main/REST:
-```go
-// WaterLowEnabled reports whether the interlock is active.
-func (c *Core) waterLowEnabled() bool { return c.waterLowCM > 0 }
-```
-Rewrite `applyPump`'s `ActionOn` branch to enforce the interlock and arm the
-failsafe (replace the existing case):
+Rewrite `applyPump` `ActionOn` to enforce the interlock + arm the failsafe:
 ```go
 	case ActionOn:
 		if c.waterLowEnabled() {
 			cm, err := c.measureDistance()
 			if err == nil && cm > c.waterLowCM {
-				// Too low: abort, warn, flash lights.
-				c.emit("water/low/state", "ON")
+				c.store.SetWater(c.waterLowCM, true) // low=true
 				c.flashLights()
 				return
 			}
-			c.emit("water/low/state", "OFF")
+			c.store.SetWater(c.waterLowCM, false)
 		}
 		if cmd.Value > 0 {
 			c.pumpLevel = cmd.Value
@@ -462,10 +417,9 @@ failsafe (replace the existing case):
 			return
 		}
 		c.armPumpFailsafe()
-		c.emit("pump/state", "ON")
-		c.emit("pump/speed/state", strconv.Itoa(c.pumpLevel))
+		c.store.SetPump(true, c.pumpLevel)
 ```
-In `applyPump`'s `ActionOff`, disarm the failsafe before emitting:
+In `applyPump` `ActionOff`, disarm first:
 ```go
 	case ActionOff:
 		c.disarmPumpFailsafe()
@@ -473,9 +427,9 @@ In `applyPump`'s `ActionOff`, disarm the failsafe before emitting:
 			log.Printf("pump off: %v", err)
 			return
 		}
-		c.emit("pump/state", "OFF")
+		c.store.SetPump(false, c.pumpLevel)
 ```
-Add the helpers (all run on the core goroutine, so no extra locking):
+Add helpers (run on the core goroutine; no extra locking):
 ```go
 func (c *Core) measureDistance() (float64, error) {
 	if c.dev.Distance == nil {
@@ -516,53 +470,41 @@ func (c *Core) disarmPumpFailsafe() {
 	}
 }
 ```
-Add `"fmt"` to the imports. Over-temp handling: add a command the monitor
-submits and have core react.
+Add over-temp handling via a new target the monitor submits:
 ```go
 const TargetOverTemp Target = 2
 
-// in apply():
-//   case TargetOverTemp: c.applyOverTemp(cmd) // cmd.Value: 1=alert,0=clear
+// in apply(): case TargetOverTemp: c.applyOverTemp(cmd)  // Value 1=alert, 0=clear
 
 func (c *Core) applyOverTemp(cmd Command) {
 	alert := cmd.Value == 1
-	if alert {
-		c.emit("overtemp/state", "ON")
-		if c.cutLightOnOverTemp && c.dev.Light != nil {
-			_ = c.dev.Light.Off()
-			c.emit("light/state", "OFF")
-		}
-	} else {
-		c.emit("overtemp/state", "OFF")
+	c.store.SetOverTemp(alert)
+	if alert && c.cutLightOnOverTemp && c.dev.Light != nil {
+		_ = c.dev.Light.Off()
+		c.store.SetLight(false, c.lightLevel)
 	}
 }
 ```
-Add `cutLightOnOverTemp bool` field + `func (c *Core) SetCutLightOnOverTemp(b bool) { c.cutLightOnOverTemp = b }`.
+Add `"fmt"` to imports.
 
 - [ ] **Step 4: Run test to verify it passes**
 
 Run: `go test ./internal/core/ -v`
-Expected: PASS (note: `flashLights` makes the low-water test take ~1.8s — keep
-`drain`'s timeout ≥2s; bump the test timeout if needed).
+Expected: PASS.
 
-> Efficiency note: `flashLights` blocks the core goroutine ~1.8s. That is
-> acceptable (no pump-on should proceed during a low-water warning) and matches
-> the Python behavior. Document it; do not background it, or the interlock would
-> race.
+> Efficiency note: `flashLights` blocks the core ~1.8s during a low-water warning
+> (matches the Python behavior and is desirable — no pump-on should proceed). Do
+> not background it, or the interlock would race.
 
 ---
 
 ### Task 4: Scheduler goroutine
 
-**Depends on:** Task 3 (core setters + interlock), Task 1 (timeline eval)
+**Depends on:** Task 3 (core setters), Task 1 (timeline eval)
 
 **Files:**
 - Create: `internal/core/scheduler.go`
 - Test: `internal/core/scheduler_test.go`
-
-The scheduler does two things: on start, apply the current implied state
-(catch-up); then each minute, submit commands for entries that just became due.
-Per-channel `enabled` gates it.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -576,11 +518,13 @@ import (
 
 	"github.com/iot-root/garden-of-eden/internal/config"
 	mockhw "github.com/iot-root/garden-of-eden/internal/hw/mock"
+	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
 func TestSchedulerCatchUpAppliesCurrentState(t *testing.T) {
+	st := state.New()
 	devs := mockhw.New()
-	c := New(devs)
+	c := New(devs, st)
 	go c.Run()
 	defer c.Stop()
 
@@ -588,20 +532,21 @@ func TestSchedulerCatchUpAppliesCurrentState(t *testing.T) {
 		{At: "06:00", Action: "on", Brightness: 70},
 		{At: "20:00", Action: "off"},
 	}}
-	s := NewScheduler(c, func() config.Schedules {
-		return config.Schedules{Light: sched}
-	})
-	// Pretend "now" is 12:00 — between on and off => light should be ON@70.
-	s.CatchUpAt(12 * 60)
+	s := NewScheduler(c, func() config.Schedules { return config.Schedules{Light: sched} })
+	s.CatchUpAt(12 * 60) // noon => on@70
 
-	if !waitInt(func() int { return devs.Light.(*mockhw.Light).Brightness() }, 70) {
-		t.Errorf("catch-up did not set brightness to 70")
+	for i := 0; i < 50; i++ {
+		if st.Snapshot().Light.Brightness == 70 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
+	t.Error("catch-up did not set brightness to 70")
 }
 
 func TestSchedulerSkipsDisabledChannel(t *testing.T) {
-	devs := mockhw.New()
-	c := New(devs)
+	st := state.New()
+	c := New(mockhw.New(), st)
 	go c.Run()
 	defer c.Stop()
 	sched := config.Schedule{Enabled: false, Entries: []config.ScheduleEntry{
@@ -611,19 +556,9 @@ func TestSchedulerSkipsDisabledChannel(t *testing.T) {
 	s.CatchUpAt(12 * 60)
 
 	time.Sleep(100 * time.Millisecond)
-	if devs.Light.(*mockhw.Light).Brightness() != 0 {
+	if st.Snapshot().Light.Brightness != 0 {
 		t.Error("disabled schedule should not drive the light")
 	}
-}
-
-func waitInt(get func() int, want int) bool {
-	for i := 0; i < 50; i++ {
-		if get() == want {
-			return true
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	return false
 }
 ```
 
@@ -644,8 +579,6 @@ import (
 	"github.com/iot-root/garden-of-eden/internal/config"
 )
 
-// Scheduler applies schedule timelines to the core. schedFn returns the current
-// schedules (read fresh each tick so REST edits take effect live).
 type Scheduler struct {
 	core    *Core
 	schedFn func() config.Schedules
@@ -658,7 +591,6 @@ func NewScheduler(c *Core, schedFn func() config.Schedules) *Scheduler {
 
 func nowMinutes(t time.Time) int { return t.Hour()*60 + t.Minute() }
 
-// CatchUpAt applies the implied state for both channels at nowMin.
 func (s *Scheduler) CatchUpAt(nowMin int) {
 	sc := s.schedFn()
 	s.applyState(TargetLight, sc.Light, nowMin)
@@ -726,129 +658,162 @@ Expected: PASS.
 
 ---
 
-### Task 5: Periodic sensor + camera publishers
+### Task 5: Periodic sensor + camera publishers (→ store/frames)
 
-**Depends on:** Plan 2 Task 1 (sensors), Plan 1 mqtt forwarding
+**Depends on:** Plan 2 Task 1 (sensors), Task 6 (frame buffer), Plan 1 state store
 
 **Files:**
+- Create: `internal/state/frames.go`
 - Create: `internal/publish/publish.go`
 - Test: `internal/publish/publish_test.go`
 
-Publishers read sensors on an interval and emit relative topics through a sink
-(the same `core.StateChange` shape the MQTT layer already forwards). Decoupling
-via a sink interface keeps them unit-testable.
+Publishers read sensors on an interval and write into the snapshot store; the
+camera publisher writes the latest JPEG into a frame buffer the REST layer
+serves.
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Implement the frame buffer**
+
+`internal/state/frames.go`:
+```go
+package state
+
+import "sync"
+
+// Frames holds the latest JPEG per camera.
+type Frames struct {
+	mu    sync.RWMutex
+	upper []byte
+	lower []byte
+}
+
+func NewFrames() *Frames { return &Frames{} }
+
+func (f *Frames) SetUpper(b []byte) { f.mu.Lock(); f.upper = b; f.mu.Unlock() }
+func (f *Frames) SetLower(b []byte) { f.mu.Lock(); f.lower = b; f.mu.Unlock() }
+
+func (f *Frames) Upper() []byte { f.mu.RLock(); defer f.mu.RUnlock(); return f.upper }
+func (f *Frames) Lower() []byte { f.mu.RLock(); defer f.mu.RUnlock(); return f.lower }
+```
+
+- [ ] **Step 2: Write the failing publisher test**
 
 `internal/publish/publish_test.go`:
 ```go
 package publish
 
 import (
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/iot-root/garden-of-eden/internal/hw/mock"
+	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
-type capture struct {
-	mu sync.Mutex
-	m  map[string]string
-}
-
-func (c *capture) Publish(topic, payload string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.m == nil {
-		c.m = map[string]string{}
-	}
-	c.m[topic] = payload
-}
-func (c *capture) get(t string) string { c.mu.Lock(); defer c.mu.Unlock(); return c.m[t] }
-
-func TestPublishOnceEmitsSensors(t *testing.T) {
+func TestPublishOnceUpdatesStore(t *testing.T) {
 	devs := mock.New()
-	cap := &capture{}
-	p := New(devs, cap, time.Hour)
+	st := state.New()
+	frames := state.NewFrames()
+	p := New(devs, st, frames, 0)
 	p.publishOnce()
 
-	for _, topic := range []string{"temperature", "humidity", "pcb/temperature", "water/level"} {
-		if cap.get(topic) == "" {
-			t.Errorf("missing publish for %q", topic)
-		}
+	snap := st.Snapshot()
+	if snap.Sensors.TemperatureC == nil || snap.Sensors.HumidityPct == nil {
+		t.Error("temperature/humidity not set in snapshot")
+	}
+	if snap.Sensors.WaterLevelCM == nil {
+		t.Error("water level not set")
+	}
+	if snap.Sensors.Pump == nil {
+		t.Error("pump power not set")
+	}
+}
+
+func TestCaptureUpdatesFrames(t *testing.T) {
+	devs := mock.New()
+	p := New(devs, state.New(), state.NewFrames(), 0)
+	p.captureOnce()
+	if len(p.frames.Upper()) == 0 {
+		t.Error("upper frame not captured")
 	}
 }
 ```
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 3: Run test to verify it fails**
 
 Run: `go test ./internal/publish/ -v`
 Expected: build failure — `undefined: New`.
 
-- [ ] **Step 3: Implement the publishers**
+- [ ] **Step 4: Implement the publishers**
 
 `internal/publish/publish.go`:
 ```go
-// Package publish runs periodic sensor and camera reads and emits MQTT-relative
-// topics through a Sink.
+// Package publish runs periodic sensor and camera reads, writing results into
+// the snapshot store and the camera frame buffer.
 package publish
 
 import (
-	"encoding/base64"
-	"fmt"
 	"log"
 	"time"
 
 	"github.com/iot-root/garden-of-eden/internal/hw"
+	"github.com/iot-root/garden-of-eden/internal/state"
 )
-
-// Sink receives device-relative topic/payload pairs (the MQTT layer prefixes
-// the base topic).
-type Sink interface {
-	Publish(topic, payload string)
-}
 
 type Publisher struct {
 	dev      hw.Devices
-	sink     Sink
+	store    *state.Store
+	frames   *state.Frames
 	interval time.Duration
 	done     chan struct{}
 }
 
-func New(dev hw.Devices, sink Sink, interval time.Duration) *Publisher {
-	return &Publisher{dev: dev, sink: sink, interval: interval, done: make(chan struct{})}
+func New(dev hw.Devices, store *state.Store, frames *state.Frames, interval time.Duration) *Publisher {
+	return &Publisher{dev: dev, store: store, frames: frames, interval: interval, done: make(chan struct{})}
 }
 
 func (p *Publisher) publishOnce() {
 	if p.dev.Env != nil {
 		if t, h, err := p.dev.Env.Read(); err == nil {
-			p.sink.Publish("temperature", fmt.Sprintf("%.2f", t))
-			p.sink.Publish("humidity", fmt.Sprintf("%.2f", h))
+			p.store.SetTemperature(t)
+			p.store.SetHumidity(h)
 		} else {
 			log.Printf("env read: %v", err)
 		}
 	}
 	if p.dev.PCBTemp != nil {
 		if t, err := p.dev.PCBTemp.Temperature(); err == nil {
-			p.sink.Publish("pcb/temperature", fmt.Sprintf("%.2f", t))
+			p.store.SetPCBTemp(t)
 		}
 	}
 	if p.dev.Distance != nil {
 		if cm, err := p.dev.Distance.MeasureCM(); err == nil {
-			p.sink.Publish("water/level", fmt.Sprintf("%.2f", cm))
+			p.store.SetWaterLevel(cm)
 		}
 	}
 	if p.dev.Power != nil {
 		if r, err := p.dev.Power.Read(); err == nil {
-			p.sink.Publish("pump/power/voltage", fmt.Sprintf("%.2f", r.BusVoltage))
-			p.sink.Publish("pump/power/current", fmt.Sprintf("%.2f", r.Current))
-			p.sink.Publish("pump/power/watts", fmt.Sprintf("%.2f", r.Power))
+			p.store.SetPumpPower(state.PumpPower{BusVoltage: r.BusVoltage, Current: r.Current, Power: r.Power})
 		}
 	}
 }
 
-// Run publishes immediately, then every interval.
+func (p *Publisher) captureOnce() {
+	if p.dev.UpperCamera != nil {
+		if b, err := p.dev.UpperCamera.Capture(); err == nil {
+			p.frames.SetUpper(b)
+		} else {
+			log.Printf("upper camera: %v", err)
+		}
+	}
+	if p.dev.LowerCamera != nil {
+		if b, err := p.dev.LowerCamera.Capture(); err == nil {
+			p.frames.SetLower(b)
+		} else {
+			log.Printf("lower camera: %v", err)
+		}
+	}
+}
+
+// Run publishes sensors immediately then every interval.
 func (p *Publisher) Run() {
 	p.publishOnce()
 	ticker := time.NewTicker(p.interval)
@@ -863,15 +828,9 @@ func (p *Publisher) Run() {
 	}
 }
 
-func (p *Publisher) Stop() { close(p.done) }
-
-// RunCameras publishes base64 JPEGs on its own (slower) interval.
+// RunCameras captures on its own (slower) interval.
 func (p *Publisher) RunCameras(interval time.Duration) {
-	tick := func() {
-		p.captureAndPublish(p.dev.UpperCamera, "image/upper_camera")
-		p.captureAndPublish(p.dev.LowerCamera, "image/lower_camera")
-	}
-	tick()
+	p.captureOnce()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -879,308 +838,48 @@ func (p *Publisher) RunCameras(interval time.Duration) {
 		case <-p.done:
 			return
 		case <-ticker.C:
-			tick()
+			p.captureOnce()
 		}
 	}
 }
 
-func (p *Publisher) captureAndPublish(cam hw.Camera, topic string) {
-	if cam == nil {
-		return
-	}
-	jpeg, err := cam.Capture()
-	if err != nil {
-		log.Printf("camera %s: %v", topic, err)
-		return
-	}
-	p.sink.Publish(topic, base64.StdEncoding.EncodeToString(jpeg))
-}
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `go test ./internal/publish/ -v`
-Expected: PASS.
-
-> Note: the original published raw JPEG bytes with `encoding: b64` discovery.
-> Here we base64-encode in the publisher and keep `encoding: b64` in discovery
-> (Task 6), so the payload is a valid UTF-8 string through the existing string
-> sink. Equivalent end result in Home Assistant.
-
----
-
-### Task 6: Discovery for sensors, water, cameras, schedule switches
-
-**Depends on:** Plan 1 discovery, Task 1 (schedule types)
-
-**Files:**
-- Modify: `internal/mqttsvc/discovery.go`
-- Test: `internal/mqttsvc/discovery_test.go` (append)
-
-Add the remaining HA entities, preserving the Python topics/`unique_id`s:
-PCB temp, temperature, humidity, water level, water-low binary sensor, water-low
-threshold number, water-low mode sensor, over-temp binary sensor, two camera
-image entities, and two schedule-enable switches (new).
-
-- [ ] **Step 1: Write the failing test (append)**
-
-Append to `internal/mqttsvc/discovery_test.go`:
-```go
-func TestExtendedDiscoveryEntities(t *testing.T) {
-	msgs := DiscoveryMessages(dev())
-	want := []string{
-		"homeassistant/sensor/gardyn/gardyn-xx_pcb_temp/config",
-		"homeassistant/sensor/gardyn/gardyn-xx_temperature/config",
-		"homeassistant/sensor/gardyn/gardyn-xx_humidity/config",
-		"homeassistant/sensor/gardyn/gardyn-xx_water_level/config",
-		"homeassistant/binary_sensor/gardyn/gardyn-xx_water_low/config",
-		"homeassistant/number/gardyn/gardyn-xx_water_low_cm/config",
-		"homeassistant/image/gardyn/gardyn-xx_upper_camera/config",
-		"homeassistant/switch/gardyn/gardyn-xx_light_schedule/config",
-		"homeassistant/switch/gardyn/gardyn-xx_pump_schedule/config",
-		"homeassistant/binary_sensor/gardyn/gardyn-xx_overtemp/config",
-	}
-	for _, topic := range want {
-		if _, ok := msgs[topic]; !ok {
-			t.Errorf("missing discovery topic %q", topic)
-		}
-	}
-}
-```
-
-- [ ] **Step 2: Run test to verify it fails**
-
-Run: `go test ./internal/mqttsvc/ -run Extended -v`
-Expected: FAIL — topics missing.
-
-- [ ] **Step 3: Extend DiscoveryMessages**
-
-In `internal/mqttsvc/discovery.go`, after the light/pump entries in
-`DiscoveryMessages`, add (preserving Python field names exactly; all include
-`"device": info` and `"availability_topic": avail`):
-```go
-	id := d.Identifier
-	sensor := func(slug, name, stateTopic, unit, deviceClass string) {
-		p := map[string]any{
-			"name": name, "unique_id": id + "_" + slug,
-			"state_topic": stateTopic, "availability_topic": avail, "device": info,
-		}
-		if unit != "" {
-			p["unit_of_measurement"] = unit
-		}
-		if deviceClass != "" {
-			p["device_class"] = deviceClass
-		}
-		out["homeassistant/sensor/gardyn/"+id+"_"+slug+"/config"] = mustJSON(p)
-	}
-	sensor("pcb_temp", "PCB Temperature", base+"/pcb/temperature", "°C", "temperature")
-	sensor("temperature", "Temperature", base+"/temperature", "°C", "temperature")
-	sensor("humidity", "Humidity", base+"/humidity", "%", "humidity")
-	sensor("water_level", "Water Level", base+"/water/level", "cm", "distance")
-	sensor("water_low_mode", "Water Low Mode", base+"/water/low/mode", "", "")
-
-	out["homeassistant/binary_sensor/gardyn/"+id+"_water_low/config"] = mustJSON(map[string]any{
-		"name": "Water Low", "unique_id": id + "_water_low", "platform": "mqtt",
-		"state_topic": base + "/water/low/state", "device_class": "problem",
-		"payload_on": "ON", "payload_off": "OFF",
-		"availability_topic": avail, "device": info,
-	})
-	out["homeassistant/number/gardyn/"+id+"_water_low_cm/config"] = mustJSON(map[string]any{
-		"name": "Set Water Low Threshold", "unique_id": id + "_water_low_cm", "platform": "mqtt",
-		"state_topic": base + "/water/low/cm", "command_topic": base + "/water/low/cm/set",
-		"min": 0, "max": 15, "step": 0.5, "unit_of_measurement": "cm", "device_class": "distance",
-		"availability_topic": avail, "device": info,
-	})
-	out["homeassistant/binary_sensor/gardyn/"+id+"_overtemp/config"] = mustJSON(map[string]any{
-		"name": "Over Temperature", "unique_id": id + "_overtemp", "platform": "mqtt",
-		"state_topic": base + "/overtemp/state", "device_class": "problem",
-		"payload_on": "ON", "payload_off": "OFF",
-		"availability_topic": avail, "device": info,
-	})
-
-	image := func(slug, name, topic string) {
-		out["homeassistant/image/gardyn/"+id+"_"+slug+"/config"] = mustJSON(map[string]any{
-			"name": name, "unique_id": id + "_" + slug, "image_topic": topic,
-			"encoding": "b64", "content_type": "image/jpeg", "object_id": id + "_" + slug,
-			"availability_topic": avail, "device": info,
-		})
-	}
-	image("upper_camera", "Upper Camera", base+"/image/upper_camera")
-	image("lower_camera", "Lower Camera", base+"/image/lower_camera")
-
-	schedSwitch := func(slug, name, stateTopic, cmdTopic string) {
-		out["homeassistant/switch/gardyn/"+id+"_"+slug+"/config"] = mustJSON(map[string]any{
-			"name": name, "unique_id": id + "_" + slug, "platform": "mqtt",
-			"state_topic": stateTopic, "command_topic": cmdTopic,
-			"payload_on": "ON", "payload_off": "OFF",
-			"availability_topic": avail, "device": info,
-		})
-	}
-	schedSwitch("light_schedule", "Light Schedule", base+"/schedule/light/state", base+"/schedule/light/set")
-	schedSwitch("pump_schedule", "Pump Schedule", base+"/schedule/pump/state", base+"/schedule/pump/set")
-```
-
-- [ ] **Step 4: Run test to verify it passes**
-
-Run: `go test ./internal/mqttsvc/ -v`
-Expected: PASS.
-
----
-
-### Task 7: MQTT command handling for water threshold + schedule switches
-
-**Depends on:** Task 3 (core setters), Task 6 (topics), Task 2 (config Save)
-
-**Files:**
-- Modify: `internal/mqttsvc/mqttsvc.go`
-- Test: `internal/mqttsvc/mqttsvc_test.go` (append)
-
-Handle the new inbound command topics: `water/low/cm/set` (updates the
-interlock threshold + persists), and `schedule/{light,pump}/set` (enable/disable
-+ persists + re-publishes switch state). These need callbacks into core/config.
-
-- [ ] **Step 1: Extend the Service constructor signature**
-
-Change `mqttsvc.New` to accept a small hooks struct so MQTT can mutate core and
-persist config without importing httpapi:
-```go
-type Hooks struct {
-	SetWaterLowCM   func(cm float64)
-	SetScheduleOn   func(channel string, on bool) // channel: "light"|"pump"
-	WaterLowCM      func() float64
-	ScheduleEnabled func(channel string) bool
-}
-
-// New(cfg, core, hooks) — thread hooks through to onMessage/onConnect.
-```
-
-- [ ] **Step 2: Write the failing test (append)**
-
-Append to `internal/mqttsvc/mqttsvc_test.go`:
-```go
-func TestWaterThresholdCommandUpdatesHook(t *testing.T) {
-	addr := startBroker(t)
-	probe, got := subClient(t, addr)
-	defer probe.Disconnect(100)
-
-	var gotCM float64
-	hooks := Hooks{
-		SetWaterLowCM:   func(cm float64) { gotCM = cm },
-		WaterLowCM:      func() float64 { return gotCM },
-		SetScheduleOn:   func(string, bool) {},
-		ScheduleEnabled: func(string) bool { return true },
-	}
-	cfg := config.Config{Device: config.DeviceConfig{BaseTopic: "gardyn", Identifier: "gardyn-xx"}}
-	host, port, _ := net.SplitHostPort(addr)
-	cfg.MQTT.Broker, cfg.MQTT.Port = host, atoiHelper(port)
-
-	c := core.New(mock.New())
-	go c.Run()
-	defer c.Stop()
-	svc, err := New(cfg, c, hooks)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer svc.Stop()
-
-	probe.Publish("gardyn/water/low/cm/set", 0, false, "8.5")
-	deadline := time.After(time.Second)
-	for gotCM != 8.5 {
-		select {
-		case <-deadline:
-			t.Fatalf("threshold not updated, got %v", gotCM)
-		case <-time.After(20 * time.Millisecond):
-		}
-	}
-	_ = got
-}
-```
-
-- [ ] **Step 3: Run test to verify it fails**
-
-Run: `go test ./internal/mqttsvc/ -run WaterThreshold -v`
-Expected: build failure — `New` signature mismatch / `Hooks` undefined.
-
-- [ ] **Step 4: Implement handling**
-
-Add `hooks Hooks` to `Service`; in `onMessage`, before the core-command mapping,
-handle the new topics:
-```go
-	switch suffix {
-	case "water/low/cm/set":
-		if f, err := strconv.ParseFloat(payload, 64); err == nil {
-			s.hooks.SetWaterLowCM(f)
-			s.client.Publish(s.base+"/water/low/cm", 0, true, fmt.Sprintf("%.2f", f))
-			mode := "Disabled"
-			if f > 0 {
-				mode = "Enabled"
-			}
-			s.client.Publish(s.base+"/water/low/mode", 0, true, mode)
-		}
-		return
-	case "schedule/light/set", "schedule/pump/set":
-		ch := strings.Split(suffix, "/")[1]
-		on := strings.EqualFold(payload, "ON")
-		s.hooks.SetScheduleOn(ch, on)
-		s.client.Publish(s.base+"/schedule/"+ch+"/state", 0, true, stateStr(on))
-		return
-	}
-```
-Add `import "fmt"` and:
-```go
-func stateStr(on bool) string {
-	if on {
-		return "ON"
-	}
-	return "OFF"
-}
-```
-In `onConnect`, after discovery, publish initial schedule switch + water states:
-```go
-	for _, ch := range []string{"light", "pump"} {
-		client.Publish(s.base+"/schedule/"+ch+"/state", 0, true, stateStr(s.hooks.ScheduleEnabled(ch)))
-	}
-	cm := s.hooks.WaterLowCM()
-	client.Publish(s.base+"/water/low/cm", 0, true, fmt.Sprintf("%.2f", cm))
-	mode := "Disabled"
-	if cm > 0 {
-		mode = "Enabled"
-	}
-	client.Publish(s.base+"/water/low/mode", 0, true, mode)
+func (p *Publisher) Stop() { close(p.done) }
 ```
 
 - [ ] **Step 5: Run test to verify it passes**
 
-Run: `go test ./internal/mqttsvc/ -v`
+Run: `go test ./internal/publish/ -v`
 Expected: PASS.
 
 ---
 
-### Task 8: REST `/schedules` CRUD
+### Task 6: REST — `/schedules` CRUD, schedule-enable, water threshold, `/camera`
 
-**Depends on:** Task 1 (schedule types), Task 2 (Save)
+**Depends on:** Task 1 (schedule types), Task 2 (Save), Task 5 (frames), Plan 2 sensor routes
 
 **Files:**
 - Modify: `internal/httpapi/httpapi.go`
 - Test: `internal/httpapi/httpapi_test.go` (append)
 
-`GET /schedules` returns current schedules; `PUT /schedules/{channel}` replaces
-one channel and persists. The handler takes getter/setter callbacks so httpapi
-stays decoupled from config persistence.
+Adds the control endpoints that replace what MQTT did, plus camera JPEG serving.
+Uses callbacks so httpapi stays decoupled from config persistence.
 
-- [ ] **Step 1: Write the failing test (append)**
+- [ ] **Step 1: Write the failing tests (append)**
 
 Append to `internal/httpapi/httpapi_test.go`:
 ```go
-func TestSchedulePutAndGet(t *testing.T) {
-	c := core.New(mock.New())
+import "github.com/iot-root/garden-of-eden/internal/config"
+
+func TestSchedulePutGetAndEnable(t *testing.T) {
+	st := state.New()
+	c := core.New(mock.New(), st)
 	go c.Run()
 	defer c.Stop()
 
 	store := config.Schedules{}
-	deps := ScheduleDeps{
-		Get: func() config.Schedules { return store },
-		Put: func(ch string, s config.Schedule) error {
+	deps := ControlDeps{
+		GetSchedules: func() config.Schedules { return store },
+		PutSchedule: func(ch string, s config.Schedule) error {
 			if ch == "light" {
 				store.Light = s
 			} else {
@@ -1188,8 +887,15 @@ func TestSchedulePutAndGet(t *testing.T) {
 			}
 			return nil
 		},
+		SetScheduleEnabled: func(ch string, on bool) error {
+			if ch == "light" {
+				store.Light.Enabled = on
+			}
+			return nil
+		},
+		SetWaterLowCM: func(cm float64) error { return nil },
 	}
-	h := HandlerWithSchedules(c, mock.New(), deps)
+	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps)
 
 	body := `{"enabled":true,"entries":[{"at":"06:00","action":"on","brightness":70}]}`
 	rec := httptest.NewRecorder()
@@ -1207,29 +913,78 @@ func TestSchedulePutAndGet(t *testing.T) {
 		t.Errorf("GET schedules = %d %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestWaterThresholdEndpoint(t *testing.T) {
+	st := state.New()
+	c := core.New(mock.New(), st)
+	go c.Run()
+	defer c.Stop()
+	var gotCM float64
+	deps := ControlDeps{
+		GetSchedules:       func() config.Schedules { return config.Schedules{} },
+		PutSchedule:        func(string, config.Schedule) error { return nil },
+		SetScheduleEnabled: func(string, bool) error { return nil },
+		SetWaterLowCM:      func(cm float64) error { gotCM = cm; return nil },
+	}
+	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/water/low-threshold", strings.NewReader(`{"cm":8.5}`)))
+	if rec.Code != http.StatusOK || gotCM != 8.5 {
+		t.Errorf("threshold endpoint: code=%d gotCM=%v", rec.Code, gotCM)
+	}
+}
+
+func TestCameraEndpoint(t *testing.T) {
+	st := state.New()
+	c := core.New(mock.New(), st)
+	go c.Run()
+	defer c.Stop()
+	frames := state.NewFrames()
+	frames.SetUpper([]byte{0xFF, 0xD8, 0xFF, 0xD9})
+	deps := ControlDeps{
+		GetSchedules: func() config.Schedules { return config.Schedules{} },
+		PutSchedule:  func(string, config.Schedule) error { return nil },
+		SetScheduleEnabled: func(string, bool) error { return nil },
+		SetWaterLowCM: func(float64) error { return nil },
+	}
+	h := HandlerFull(c, st, mock.New(), frames, deps)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/camera/upper.jpg", nil))
+	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "image/jpeg" {
+		t.Errorf("camera endpoint: code=%d ct=%s", rec.Code, rec.Header().Get("Content-Type"))
+	}
+}
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `go test ./internal/httpapi/ -run Schedule -v`
-Expected: build failure — `undefined: ScheduleDeps`.
+Run: `go test ./internal/httpapi/ -run 'Schedule|Water|Camera' -v`
+Expected: build failure — `undefined: ControlDeps`/`HandlerFull`.
 
 - [ ] **Step 3: Implement the routes**
 
-In `internal/httpapi/httpapi.go`:
+In `internal/httpapi/httpapi.go` add (building on Plan 2's `sensorMux`):
 ```go
-import "github.com/iot-root/garden-of-eden/internal/config"
+import (
+	"github.com/iot-root/garden-of-eden/internal/config"
+	"github.com/iot-root/garden-of-eden/internal/hw"
+	"github.com/iot-root/garden-of-eden/internal/state"
+)
 
-type ScheduleDeps struct {
-	Get func() config.Schedules
-	Put func(channel string, s config.Schedule) error
+type ControlDeps struct {
+	GetSchedules       func() config.Schedules
+	PutSchedule        func(channel string, s config.Schedule) error
+	SetScheduleEnabled func(channel string, enabled bool) error
+	SetWaterLowCM      func(cm float64) error
 }
 
-func HandlerWithSchedules(c *core.Core, d hw.Devices, sd ScheduleDeps) http.Handler {
-	mux := sensorMux(c, d) // factored from HandlerWithSensors, returns *http.ServeMux
+// HandlerFull is the complete API: base control + sensor reads + schedules +
+// water + cameras.
+func HandlerFull(c *core.Core, st *state.Store, d hw.Devices, frames *state.Frames, deps ControlDeps) http.Handler {
+	mux := sensorMux(c, st, d) // Plan 2 returns *http.ServeMux (base + sensor GET routes)
 
 	mux.HandleFunc("GET /schedules", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, sd.Get())
+		writeJSON(w, http.StatusOK, deps.GetSchedules())
 	})
 	mux.HandleFunc("PUT /schedules/{channel}", func(w http.ResponseWriter, r *http.Request) {
 		ch := r.PathValue("channel")
@@ -1248,18 +1003,69 @@ func HandlerWithSchedules(c *core.Core, d hw.Devices, sd ScheduleDeps) http.Hand
 				return
 			}
 		}
-		if err := sd.Put(ch, s); err != nil {
+		if err := deps.PutSchedule(ch, s); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "saved"})
 	})
+	mux.HandleFunc("POST /schedule/{channel}/enabled", func(w http.ResponseWriter, r *http.Request) {
+		ch := r.PathValue("channel")
+		if ch != "light" && ch != "pump" {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown channel"})
+			return
+		}
+		var body struct {
+			Enabled bool `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+			return
+		}
+		if err := deps.SetScheduleEnabled(ch, body.Enabled); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		st.SetScheduleEnabled(ch, body.Enabled)
+		writeJSON(w, http.StatusOK, map[string]bool{"enabled": body.Enabled})
+	})
+	mux.HandleFunc("POST /water/low-threshold", func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			CM float64 `json:"cm"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.CM < 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cm must be >= 0"})
+			return
+		}
+		if err := deps.SetWaterLowCM(body.CM); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]float64{"cm": body.CM})
+	})
+
+	serveFrame := func(get func() []byte) http.HandlerFunc {
+		return func(w http.ResponseWriter, _ *http.Request) {
+			b := get()
+			if len(b) == 0 {
+				http.Error(w, "no frame yet", http.StatusServiceUnavailable)
+				return
+			}
+			w.Header().Set("Content-Type", "image/jpeg")
+			_, _ = w.Write(b)
+		}
+	}
+	mux.HandleFunc("GET /camera/upper.jpg", serveFrame(frames.Upper))
+	mux.HandleFunc("GET /camera/lower.jpg", serveFrame(frames.Lower))
+
 	return mux
 }
 ```
-Refactor: extract the sensor-route body from `HandlerWithSensors` into
-`func sensorMux(c *core.Core, d hw.Devices) *http.ServeMux` and have
-`HandlerWithSensors` return it, so both share the base.
+
+> Plan 2 dependency: ensure Plan 2's sensor handler is refactored to expose
+> `func sensorMux(c *core.Core, st *state.Store, d hw.Devices) *http.ServeMux`
+> that starts from Plan 1's `baseMux(c, st)` and adds the sensor GET routes.
+> `HandlerFull` builds on it.
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -1268,90 +1074,105 @@ Expected: PASS.
 
 ---
 
-### Task 9: Wire everything in main, full suite, commit
+### Task 7: Optional zeroconf advertiser
 
-**Depends on:** Tasks 3–8
+**Depends on:** Plan 1 main
+
+**Files:**
+- Create: `internal/discovery/discovery.go`
+
+Advertises `_gardynd._tcp` on the LAN so the HA integration can auto-discover the
+service. Best-effort: failure to advertise never blocks startup.
+
+- [ ] **Step 1: Implement the advertiser**
+
+`internal/discovery/discovery.go`:
+```go
+// Package discovery advertises gardynd via mDNS/zeroconf (_gardynd._tcp).
+package discovery
+
+import (
+	"log"
+
+	"github.com/grandcat/zeroconf"
+)
+
+// Advertise registers the service. Returns a shutdown func; both are no-ops on
+// error (best-effort).
+func Advertise(instance string, port int) func() {
+	server, err := zeroconf.Register(instance, "_gardynd._tcp", "local.", port, []string{"path=/state"}, nil)
+	if err != nil {
+		log.Printf("zeroconf advertise failed (continuing): %v", err)
+		return func() {}
+	}
+	return server.Shutdown
+}
+```
+
+- [ ] **Step 2: Add dependency, build**
+
+Run: `go get github.com/grandcat/zeroconf@latest && go build ./internal/discovery/`
+Expected: builds.
+
+---
+
+### Task 8: Wire everything in main, full suite, commit
+
+**Depends on:** Tasks 3–7
 
 **Files:**
 - Modify: `cmd/gardynd/main.go`
 
-- [ ] **Step 1: Wire scheduler, publishers, hooks, config persistence**
+- [ ] **Step 1: Wire scheduler, publishers, control deps, config persistence**
 
-In `cmd/gardynd/main.go` after building `core` and before blocking on signal:
+After building `core`/`store`/`devs` (and only for `--hw=real`/`mock`):
 ```go
-	// Apply persisted settings to core.
 	c.SetWaterLowCM(cfg.Water.LowCM)
 	c.SetPumpMaxRuntime(10 * time.Minute)
 	c.SetCutLightOnOverTemp(cfg.OverTemp.CutLight)
 
-	// Live schedule store, guarded for REST edits.
 	var schedMu sync.Mutex
 	schedules := cfg.Schedules
+	st.SetScheduleEnabled("light", schedules.Light.Enabled)
+	st.SetScheduleEnabled("pump", schedules.Pump.Enabled)
+
 	getSchedules := func() config.Schedules { schedMu.Lock(); defer schedMu.Unlock(); return schedules }
+	persist := func() error {
+		if *configPath == "" {
+			return nil
+		}
+		schedMu.Lock(); cfg.Schedules = schedules; snapshot := cfg; schedMu.Unlock()
+		return snapshot.Save(*configPath)
+	}
 	putSchedule := func(ch string, s config.Schedule) error {
 		schedMu.Lock()
-		if ch == "light" {
-			schedules.Light = s
-		} else {
-			schedules.Pump = s
-		}
-		cfg.Schedules = schedules
+		if ch == "light" { schedules.Light = s } else { schedules.Pump = s }
 		schedMu.Unlock()
-		if *configPath != "" {
-			return cfg.Save(*configPath)
-		}
-		return nil
+		st.SetScheduleEnabled(ch, s.Enabled)
+		return persist()
+	}
+	setSchedEnabled := func(ch string, on bool) error {
+		schedMu.Lock()
+		if ch == "light" { schedules.Light.Enabled = on } else { schedules.Pump.Enabled = on }
+		schedMu.Unlock()
+		return persist()
+	}
+	setWaterCM := func(cm float64) error {
+		c.SetWaterLowCM(cm)
+		schedMu.Lock(); cfg.Water.LowCM = cm; schedMu.Unlock()
+		return persist()
 	}
 
 	sched := core.NewScheduler(c, getSchedules)
 	go sched.Run()
 	defer sched.Stop()
 
-	hooks := mqttsvc.Hooks{
-		SetWaterLowCM: func(cm float64) {
-			c.SetWaterLowCM(cm)
-			schedMu.Lock(); cfg.Water.LowCM = cm; schedMu.Unlock()
-			if *configPath != "" { _ = cfg.Save(*configPath) }
-		},
-		WaterLowCM:      func() float64 { return cfg.Water.LowCM },
-		SetScheduleOn:   func(ch string, on bool) {
-			schedMu.Lock()
-			if ch == "light" { schedules.Light.Enabled = on } else { schedules.Pump.Enabled = on }
-			cfg.Schedules = schedules
-			schedMu.Unlock()
-			if *configPath != "" { _ = cfg.Save(*configPath) }
-		},
-		ScheduleEnabled: func(ch string) bool {
-			schedMu.Lock(); defer schedMu.Unlock()
-			if ch == "light" { return schedules.Light.Enabled }
-			return schedules.Pump.Enabled
-		},
-	}
-
-	// MQTT sink adapter for publishers.
-	pub := publish.New(devs, mqttSink{svc}, 30*time.Minute)
+	frames := state.NewFrames()
+	pub := publish.New(devs, st, frames, 30*time.Minute)
 	go pub.Run()
 	go pub.RunCameras(time.Duration(cfg.Camera.IntervalSeconds) * time.Second)
 	defer pub.Stop()
-```
-Update the `mqttsvc.New` call to pass `hooks`; update the HTTP handler to
-`httpapi.HandlerWithSchedules(c, devs, httpapi.ScheduleDeps{Get: getSchedules, Put: putSchedule})`.
-Add a thin sink that forwards to MQTT — add an exported method on the MQTT
-service and the adapter:
-```go
-// in mqttsvc: func (s *Service) PublishRelative(topic, payload string) { s.client.Publish(s.base+"/"+topic, 0, false, payload) }
 
-type mqttSink struct{ svc *mqttsvc.Service }
-func (m mqttSink) Publish(topic, payload string) { m.svc.PublishRelative(topic, payload) }
-```
-Add `IntervalSeconds int yaml:"interval_seconds"` to `config.CameraConfig`
-(default 3600, env `IMAGE_INTERVAL_SECONDS`) in Plan 2's config — if not
-present, add it here. Add imports: `sync`, `time`, `internal/publish`.
-
-- [ ] **Step 2: Wire the button gestures (single=light, double=pump)**
-
-Add after the scheduler start:
-```go
 	if devs.Button != nil {
 		go func() {
 			for ev := range devs.Button.Events() {
@@ -1364,34 +1185,43 @@ Add after the scheduler start:
 			}
 		}()
 	}
+
+	stop := discovery.Advertise("gardynd-"+cfg.Device.Identifier, cfg.HTTP.Port)
+	defer stop()
+
+	deps := httpapi.ControlDeps{
+		GetSchedules: getSchedules, PutSchedule: putSchedule,
+		SetScheduleEnabled: setSchedEnabled, SetWaterLowCM: setWaterCM,
+	}
+	server := &http.Server{Addr: addr, Handler: httpapi.HandlerFull(c, st, devs, frames, deps)}
 ```
-(`SinglePress` toggling is acceptable as on-press; full toggle parity can track
-current state via core in a later refinement — out of scope here.)
+Add imports: `sync`, `time`, `internal/publish`, `internal/discovery`, `internal/hw`.
+Ensure `config.CameraConfig.IntervalSeconds` (default 3600, env
+`IMAGE_INTERVAL_SECONDS`) exists from Plan 2; if not, add it.
 
-> Design note: the Python button *toggled*. To match exactly, add `ActionToggle`
-> to core; deferred as a small follow-up since on-press is functionally close and
-> the spec did not call out toggle semantics. If exact parity is required, add
-> the toggle action in this task.
+> Design note: the Python button *toggled*. On-press here turns on; exact toggle
+> parity can be a small follow-up (add `ActionToggle` to core). The spec did not
+> require toggle semantics.
 
-- [ ] **Step 3: Build and run full suite**
+- [ ] **Step 2: Build and run full suite**
 
-Run: `make tidy && make build && make build-pi && go test ./...`
-Expected: all PASS, both binaries build.
+Run: `make tidy && make build && make build-pi && go test ./... -race`
+Expected: all PASS, both binaries build, no races.
 
-- [ ] **Step 4: Mock end-to-end check**
+- [ ] **Step 3: Mock end-to-end check**
 
 Run `./bin/gardynd --hw=mock --config /tmp/g.yaml` (seed `/tmp/g.yaml` with a
-light schedule whose "on" time is in the past). Confirm via `mosquitto_sub`:
-catch-up turns the light on at start, `gardyn/schedule/light/state` is `ON`,
-`PUT /schedules/light` updates `/tmp/g.yaml`, and `water/low/cm/set` updates the
-threshold + mode.
+light schedule whose "on" time is in the past). Confirm: `GET /state` shows the
+light on (catch-up) and sensor values populated; `PUT /schedules/light` updates
+`/tmp/g.yaml`; `POST /water/low-threshold {"cm":8}` updates `state.water`;
+`GET /camera/upper.jpg` returns JPEG bytes.
 
-- [ ] **Step 5: Commit (single commit)**
+- [ ] **Step 4: Commit (single commit)**
 
 Run:
 ```
 git add internal/ cmd/ go.mod go.sum
-git commit -m "feat: scheduler, water-low interlock, pump failsafe, over-temp, sensor/camera publishers, schedule API"
+git commit -m "feat: scheduler, water-low interlock, pump failsafe, over-temp, sensor/camera publishers, schedule+water REST, zeroconf"
 ```
 
 ---
@@ -1399,35 +1229,31 @@ git commit -m "feat: scheduler, water-low interlock, pump failsafe, over-temp, s
 ## Self-Review
 
 **Spec coverage:** state-based scheduler + restart catch-up ✓; midnight wrap ✓;
-per-channel enable/disable via MQTT switch + REST ✓; schedule CRUD persisted
-atomically ✓; water-low interlock across MQTT/REST/button/scheduler (enforced in
-core, all paths funnel through `applyPump`) ✓; flash-lights warning ✓; pump
-max-runtime failsafe ✓; over-temp binary_sensor + optional cut-light ✓; periodic
-sensor publishers (temp/humidity/pcb/water/power) ✓; camera publishing + image
-discovery ✓; availability retained on all new entities ✓. The HA custom
-integration remains the separate follow-up (consumes `/schedules` + schedule
-switches defined here).
+per-channel enable/disable via REST ✓; schedule CRUD persisted atomically ✓;
+water-low interlock across REST/button/scheduler (all funnel through `applyPump`)
+✓; flash-lights warning ✓; pump max-runtime failsafe ✓; over-temp → snapshot +
+optional cut-light ✓; periodic sensor reads into store ✓; camera capture + JPEG
+serving ✓; water threshold REST ✓; zeroconf ✓; no MQTT ✓. The HA integration
+consumes `/state` + `/schedules` + `/schedule/{ch}/enabled` + `/water/low-threshold`
++ `/camera/*.jpg`.
 
-**Placeholder scan:** Two explicit design notes (button toggle semantics; camera
-b64 encoding) describe concrete, in-scope-or-deferred decisions, not unfinished
-code. No "TBD"/"handle edge cases" placeholders.
+**Placeholder scan:** Only the button-toggle and Plan-2 `sensorMux` notes, both
+concrete (deferred-with-instructions / cross-plan contract), not "TBD".
 
-**Type consistency:** `config.Schedule{Enabled, Entries}`,
-`config.ScheduleEntry{At, Action, Brightness}`, `Schedule.StateAt(int)
-(ChannelState,bool)`, `Schedule.DueBetween(int,int)`, `core.NewScheduler(*Core,
-func() config.Schedules)`, `core.SetWaterLowCM/SetPumpMaxRuntime/SetCutLightOnOverTemp`,
-`mqttsvc.Hooks{SetWaterLowCM, SetScheduleOn, WaterLowCM, ScheduleEnabled}`,
-`mqttsvc.Service.PublishRelative`, `publish.New(hw.Devices, Sink, time.Duration)`,
-`httpapi.ScheduleDeps{Get, Put}` / `HandlerWithSchedules` are used identically
-across tasks and main. Relative publish topics (`temperature`, `water/level`,
-`overtemp/state`, `schedule/light/state`, …) match the discovery `state_topic`s
-once the MQTT layer prepends `<base>/`.
+**Type consistency:** `config.Schedule/ScheduleEntry/Schedules`,
+`Schedule.StateAt/DueBetween`, `core.NewScheduler(*Core, func() config.Schedules)`,
+`core.SetWaterLowCM/SetPumpMaxRuntime/SetCutLightOnOverTemp`,
+`state.Frames` (`SetUpper/Upper/...`), `state.PumpPower`,
+`publish.New(hw.Devices, *state.Store, *state.Frames, time.Duration)`,
+`httpapi.ControlDeps{GetSchedules, PutSchedule, SetScheduleEnabled, SetWaterLowCM}`
++ `HandlerFull` are used identically across tasks and main. Core writes to the
+store via the Plan 1 setters (`SetPump`, `SetWater`, `SetOverTemp`, `SetLight`).
 
-**Dependency audit:** Task 1 (none) is pure. Task 2 depends on Task 1 (schedule
-types in config). Task 3 depends on Task 2 + Plan 2 sensors. Task 4 depends on
-Tasks 1+3. Task 5 depends on Plan 2 (sensors) only — disjoint package
-(`internal/publish`), parallelizable with Task 6. Task 6 depends on Task 1
-(schedule existence only for switch topics — actually uses just `DeviceConfig`;
-safe). Task 7 depends on Tasks 3+6 (shares `mqttsvc` with Task 6 → serialized).
-Task 8 depends on Tasks 1+2. Task 9 modifies `main.go` and depends on 3–8. No
-`Depends on: none` task (only Task 1) shares files with another. Audit clean.
+**Dependency audit:** Task 1 (none) pure. Task 2 → Task 1. Task 3 → Task 2 + Plan
+2 sensors. Task 4 → Tasks 1+3. Task 5 creates `state/frames.go` + `internal/publish`
+(depends on Plan 2 sensors + Task 6? No — Task 5 defines frames; Task 6 consumes
+frames). Corrected order: Task 5 defines `state.Frames` and the publisher; Task 6
+(httpapi) depends on Task 5 for `*state.Frames`. Task 6 also depends on Tasks 1+2
+and Plan 2's `sensorMux`. Task 7 independent (`internal/discovery`). Task 8
+modifies `main.go`, depends on 3–7. Only Task 1 and Task 7 are dependency-free
+and they touch disjoint packages. Audit clean.
