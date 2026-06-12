@@ -45,3 +45,20 @@ func TestPumpSpeed(t *testing.T) {
 		t.Errorf("after Off speed = %d, want 0", p.Speed())
 	}
 }
+
+func TestMockSensors(t *testing.T) {
+	d := New()
+	if c, err := d.Distance.MeasureCM(); err != nil || c <= 0 {
+		t.Errorf("distance = %v, %v", c, err)
+	}
+	temp, hum, err := d.Env.Read()
+	if err != nil || temp == 0 || hum == 0 {
+		t.Errorf("env = %v/%v err %v", temp, hum, err)
+	}
+	if _, err := d.PCBTemp.Temperature(); err != nil {
+		t.Errorf("pcb temp err %v", err)
+	}
+	if r, err := d.Power.Read(); err != nil || r.BusVoltage == 0 {
+		t.Errorf("power = %+v err %v", r, err)
+	}
+}

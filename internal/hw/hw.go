@@ -16,8 +16,63 @@ type Pump interface {
 	Off() error
 }
 
-// Devices bundles the hardware the core controls. Later plans add sensor fields.
+// DistanceSensor measures water-tank distance in centimeters.
+type DistanceSensor interface {
+	MeasureCM() (float64, error)
+}
+
+// EnvSensor reads ambient temperature (°C) and relative humidity (%).
+type EnvSensor interface {
+	Read() (tempC float64, humidityPct float64, err error)
+}
+
+// PCBTempSensor reads board temperature and the over-temp alert state.
+type PCBTempSensor interface {
+	Temperature() (float64, error)
+	OverTemp() (bool, error)
+}
+
+// PowerReading is an INA219 sample.
+type PowerReading struct {
+	BusVoltage   float64
+	ShuntVoltage float64
+	Current      float64
+	Power        float64
+}
+
+// PowerSensor reads pump power telemetry.
+type PowerSensor interface {
+	Read() (PowerReading, error)
+}
+
+// Camera captures a JPEG frame.
+type Camera interface {
+	Capture() ([]byte, error)
+}
+
+// ButtonEvent is a debounced button gesture.
+type ButtonEvent int
+
+const (
+	SinglePress ButtonEvent = iota
+	DoublePress
+)
+
+// Button delivers debounced press gestures.
+type Button interface {
+	Events() <-chan ButtonEvent
+}
+
+// Devices bundles the hardware the service controls. Sensor fields may be nil
+// when a sensor failed to initialize (mirrors the Python "sensor == None" guard).
 type Devices struct {
-	Light Light
-	Pump  Pump
+	Light       Light
+	Pump        Pump
+	Distance    DistanceSensor
+	Env         EnvSensor
+	PCBTemp     PCBTempSensor
+	Power       PowerSensor
+	UpperCamera Camera
+	LowerCamera Camera
+	Button      Button
 }
