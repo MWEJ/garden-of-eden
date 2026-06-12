@@ -5,6 +5,7 @@ package core
 
 import (
 	"log"
+	"sync"
 
 	"github.com/iot-root/garden-of-eden/internal/hw"
 	"github.com/iot-root/garden-of-eden/internal/state"
@@ -36,6 +37,7 @@ type Core struct {
 	store      *state.Store
 	cmds       chan Command
 	done       chan struct{}
+	stopOnce   sync.Once
 	lightLevel int
 	pumpLevel  int
 }
@@ -51,8 +53,13 @@ func New(dev hw.Devices, store *state.Store) *Core {
 	}
 }
 
-func (c *Core) Submit(cmd Command) { c.cmds <- cmd }
-func (c *Core) Stop()              { close(c.done) }
+func (c *Core) Submit(cmd Command) {
+	select {
+	case c.cmds <- cmd:
+	case <-c.done:
+	}
+}
+func (c *Core) Stop() { c.stopOnce.Do(func() { close(c.done) }) }
 
 func (c *Core) Run() {
 	for {

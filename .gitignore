@@ -6,5 +6,8 @@ venv/
 # If using Jython
 *.class
 .env
-bin/
+# Go build artifacts (bin/ also holds tracked project shell scripts, so ignore
+# only the compiled binaries, not the whole directory).
+/bin/gardynd
+/bin/gardynd-armv6
 /gardynd

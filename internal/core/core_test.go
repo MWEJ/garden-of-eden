@@ -49,3 +49,30 @@ func TestPumpOffUpdatesSnapshot(t *testing.T) {
 	}
 	t.Error("pump.on stayed true")
 }
+
+func TestStopIdempotent(t *testing.T) {
+	c := New(mock.New(), state.New())
+	go c.Run()
+	c.Stop()
+	c.Stop() // must not panic on double Stop
+}
+
+func TestSubmitAfterStopDoesNotBlock(t *testing.T) {
+	c := New(mock.New(), state.New())
+	go c.Run()
+	c.Stop()
+	time.Sleep(20 * time.Millisecond) // let Run observe done and exit
+
+	completed := make(chan struct{})
+	go func() {
+		for i := 0; i < 100; i++ {
+			c.Submit(Command{Target: TargetLight, Action: ActionOn})
+		}
+		close(completed)
+	}()
+	select {
+	case <-completed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Submit blocked after Stop")
+	}
+}

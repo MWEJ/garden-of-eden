@@ -1083,3 +1083,28 @@ parallelize. Task 5 depends on Tasks 3+4 (uses both). Task 6 depends on Tasks
 4+5. Task 7 modifies `cmd/gardynd/main.go` (from Task 1) and imports every
 package → depends on all. No `Depends on: none` task shares files with another.
 Audit clean.
+
+---
+
+## Post-execution amendments (from code review during subagent-driven execution)
+
+Two correctness/robustness fixes were applied beyond the code blocks above and
+are reflected in the committed implementation:
+
+1. **Task 4 — `state.Snapshot()` deep-copies the `Schedules` map.** The shallow
+   struct copy shared the `map` by reference, so a caller marshaling a returned
+   snapshot (lock-free) could race a concurrent `SetScheduleEnabled` map write.
+   `Snapshot()` now allocates a fresh map and copies the (value-type)
+   `SchedFlag` entries under the read lock. A regression test
+   (`TestConcurrentScheduleWriteAndMarshal`) fails under `-race` without the fix
+   and passes with it. Pointer sensor fields were already race-free (setters
+   swap in a pointer to a fresh local).
+
+2. **Task 5 — `core.Stop()` is idempotent and `Submit()` is non-blocking after
+   stop.** `Stop()` now uses a `sync.Once` (`stopOnce`) so a double `Stop()`
+   cannot panic on close-of-closed-channel; `Submit()` `select`s on `done` so a
+   post-stop submit can never block/leak a goroutine. Covered by
+   `TestStopIdempotent` and `TestSubmitAfterStopDoesNotBlock`.
+
+Deferred (accepted) review notes: graceful `server.Shutdown` on signal → Plan 4
+(ops); request-body size limit / strict JSON decode on POST bodies → Plan 3.
