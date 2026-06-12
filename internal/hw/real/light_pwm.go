@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/iot-root/garden-of-eden/internal/hw"
 )
 
 const pwmChip = "/sys/class/pwm/pwmchip0"
@@ -31,13 +33,13 @@ func newPWMLine(channel, freqHz int) (*pwmLine, error) {
 	periodNS := int(time.Second) / freqHz
 	l := &pwmLine{dir: dir, periodNS: periodNS}
 	if err := l.write("period", strconv.Itoa(periodNS)); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("set pwm%d period: %w", channel, err)
 	}
 	if err := l.write("duty_cycle", "0"); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("set pwm%d duty_cycle: %w", channel, err)
 	}
 	if err := l.write("enable", "1"); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("enable pwm%d: %w", channel, err)
 	}
 	return l, nil
 }
@@ -76,3 +78,5 @@ func NewLightPWM() (*LightPWM, error) {
 func (l *LightPWM) SetBrightness(pct int) error { return l.line.setPercent(pct) }
 func (l *LightPWM) Brightness() int             { return l.line.percent() }
 func (l *LightPWM) Off() error                  { return l.line.setPercent(0) }
+
+var _ hw.Light = (*LightPWM)(nil)
