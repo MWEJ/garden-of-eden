@@ -6,3 +6,5 @@ venv/
 # If using Jython
 *.class
 .env
+bin/
+/gardynd
