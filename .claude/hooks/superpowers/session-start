@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# SessionStart hook for superpowers (project-level install)
+# Skills live in <repo>/.claude/skills; this script lives in
+# <repo>/.claude/hooks/superpowers, so the skills root is two levels up.
+
+set -euo pipefail
+
+# Determine the .claude root directory that holds the skills/ library.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
+# Read using-superpowers content, stripping the YAML frontmatter (the
+# name/description block is loader metadata — injecting it wastes context
+# tokens) and any control characters that would make the JSON below invalid
+# (tab, newline, and carriage return are kept; escape_for_json handles them).
+using_superpowers_content=$(
+  awk 'NR==1 && $0=="---" {fm=1; next} fm==1 {if ($0=="---") fm=2; next} {print}' \
+    "${PLUGIN_ROOT}/skills/using-superpowers/SKILL.md" 2>/dev/null \
+  | tr -d '\000-\010\013\014\016-\037' \
+  || echo "Error reading using-superpowers skill"
+)
+
+# Escape string for JSON embedding using bash parameter substitution.
+# Each ${s//old/new} is a single C-level pass - orders of magnitude
+# faster than the character-by-character loop this replaces.
+escape_for_json() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    printf '%s' "$s"
+}
+
+using_superpowers_escaped=$(escape_for_json "$using_superpowers_content")
+session_context="<EXTREMELY_IMPORTANT>\nYou have superpowers.\n\n**Below is the full content of your 'superpowers:using-superpowers' skill - your introduction to using skills. For all other skills, use the 'Skill' tool:**\n\n${using_superpowers_escaped}\n</EXTREMELY_IMPORTANT>"
+
+# Output context injection as JSON.
+# Cursor hooks expect additional_context (snake_case).
+# Claude Code hooks expect hookSpecificOutput.additionalContext (nested).
+# Copilot CLI (v1.0.11+) and others expect additionalContext (top-level, SDK standard).
+# Claude Code reads BOTH additional_context and hookSpecificOutput without
+# deduplication, so we must emit only the field the current platform consumes.
+#
+# Uses printf instead of heredoc to work around bash 5.3+ heredoc hang.
+# See: https://github.com/obra/superpowers/issues/571
+if [ -n "${CURSOR_PLUGIN_ROOT:-}" ]; then
+  # Cursor sets CURSOR_PLUGIN_ROOT (may also set CLAUDE_PLUGIN_ROOT)
+  printf '{\n  "additional_context": "%s"\n}\n' "$session_context"
+elif [ -n "${COPILOT_CLI:-}" ]; then
+  # Copilot CLI (sets COPILOT_CLI=1) — SDK standard top-level format
+  printf '{\n  "additionalContext": "%s"\n}\n' "$session_context"
+else
+  # Claude Code (default) expects hookSpecificOutput.additionalContext
+  printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$session_context"
+fi
+
+exit 0
