@@ -11,11 +11,13 @@ import (
 
 // PumpPWM implements hw.Pump via a software-PWM goroutine at the given freq.
 type PumpPWM struct {
-	line   *gpiocdev.Line
-	period time.Duration
-	mu     sync.Mutex
-	pct    int
-	done   chan struct{}
+	line     *gpiocdev.Line
+	period   time.Duration
+	mu       sync.Mutex
+	pct      int
+	done     chan struct{}
+	finished chan struct{}
+	once     sync.Once
 }
 
 func NewPumpPWM(chip string, gpio, freqHz int) (*PumpPWM, error) {
@@ -24,15 +26,17 @@ func NewPumpPWM(chip string, gpio, freqHz int) (*PumpPWM, error) {
 		return nil, fmt.Errorf("request gpio%d: %w", gpio, err)
 	}
 	p := &PumpPWM{
-		line:   line,
-		period: time.Second / time.Duration(freqHz),
-		done:   make(chan struct{}),
+		line:     line,
+		period:   time.Second / time.Duration(freqHz),
+		done:     make(chan struct{}),
+		finished: make(chan struct{}),
 	}
 	go p.loop()
 	return p, nil
 }
 
 func (p *PumpPWM) loop() {
+	defer close(p.finished)
 	for {
 		select {
 		case <-p.done:
@@ -73,8 +77,12 @@ func (p *PumpPWM) SetSpeed(pct int) error {
 func (p *PumpPWM) Speed() int { p.mu.Lock(); defer p.mu.Unlock(); return p.pct }
 func (p *PumpPWM) Off() error { return p.SetSpeed(0) }
 
+// Close stops the PWM loop, drives the line low (pump off), and releases it.
+// Safe to call more than once.
 func (p *PumpPWM) Close() error {
-	close(p.done)
+	p.once.Do(func() { close(p.done) })
+	<-p.finished           // wait until the loop stops touching the line
+	_ = p.line.SetValue(0) // ensure the pump is off before releasing
 	return p.line.Close()
 }
 
