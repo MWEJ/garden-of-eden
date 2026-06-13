@@ -20,15 +20,31 @@ type DeviceConfig struct {
 	Version    string `yaml:"version"`
 }
 
+type CameraConfig struct {
+	UpperDevice     string `yaml:"upper_device"`
+	LowerDevice     string `yaml:"lower_device"`
+	Resolution      string `yaml:"resolution"`
+	IntervalSeconds int    `yaml:"interval_seconds"`
+}
+
 type Config struct {
-	HTTP   HTTPConfig   `yaml:"http"`
-	Device DeviceConfig `yaml:"device"`
+	HTTP       HTTPConfig   `yaml:"http"`
+	Device     DeviceConfig `yaml:"device"`
+	Camera     CameraConfig `yaml:"camera"`
+	SensorType string       `yaml:"sensor_type"`
 }
 
 func defaults() Config {
 	return Config{
 		HTTP:   HTTPConfig{Port: 5000},
 		Device: DeviceConfig{Identifier: "gardyn-xx", Model: "gardyn 3.0", Version: "1.0.0"},
+		Camera: CameraConfig{
+			UpperDevice:     "/dev/video0",
+			LowerDevice:     "/dev/video2",
+			Resolution:      "640x480",
+			IntervalSeconds: 3600,
+		},
+		SensorType: "AM2320",
 	}
 }
 
@@ -46,6 +62,9 @@ func Load(path string) (Config, error) {
 		}
 	}
 	applyEnv(&c)
+	if c.Camera.IntervalSeconds <= 0 {
+		c.Camera.IntervalSeconds = 3600
+	}
 	return c, nil
 }
 
@@ -54,6 +73,11 @@ func applyEnv(c *Config) {
 	envStr(&c.Device.Identifier, "MQTT_IDENTIFIER") // legacy key name retained
 	envStr(&c.Device.Model, "MQTT_DEVICE_MODEL")
 	envStr(&c.Device.Version, "MQTT_VERSION")
+	envStr(&c.Camera.UpperDevice, "UPPER_CAMERA_DEVICE")
+	envStr(&c.Camera.LowerDevice, "LOWER_CAMERA_DEVICE")
+	envStr(&c.Camera.Resolution, "CAMERA_RESOLUTION")
+	envInt(&c.Camera.IntervalSeconds, "IMAGE_INTERVAL_SECONDS")
+	envStr(&c.SensorType, "SENSOR_TYPE")
 }
 
 func envStr(dst *string, key string) {

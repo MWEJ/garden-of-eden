@@ -39,3 +39,33 @@ func TestFileThenEnvOverride(t *testing.T) {
 		t.Errorf("identifier = %q, want gardyn-env", c.Device.Identifier)
 	}
 }
+
+func TestCameraSensorDefaultsAndEnv(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Camera.UpperDevice != "/dev/video0" || c.Camera.Resolution != "640x480" || c.Camera.IntervalSeconds != 3600 {
+		t.Errorf("camera defaults: %+v", c.Camera)
+	}
+	t.Setenv("SENSOR_TYPE", "DHT20")
+	t.Setenv("CAMERA_RESOLUTION", "1280x720")
+	c, err = Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.SensorType != "DHT20" || c.Camera.Resolution != "1280x720" {
+		t.Errorf("env override: SensorType=%q res=%q", c.SensorType, c.Camera.Resolution)
+	}
+}
+
+func TestIntervalSecondsClampedPositive(t *testing.T) {
+	t.Setenv("IMAGE_INTERVAL_SECONDS", "0")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Camera.IntervalSeconds <= 0 {
+		t.Errorf("IntervalSeconds = %d, want > 0 (clamped)", c.Camera.IntervalSeconds)
+	}
+}
