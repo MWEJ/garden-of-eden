@@ -1,0 +1,13 @@
+{
+  "domain": "gardyn",
+  "name": "Gardyn",
+  "version": "0.1.0",
+  "documentation": "https://github.com/iot-root/garden-of-eden",
+  "issue_tracker": "https://github.com/iot-root/garden-of-eden/issues",
+  "codeowners": [],
+  "iot_class": "local_polling",
+  "integration_type": "device",
+  "config_flow": true,
+  "requirements": [],
+  "zeroconf": ["_gardynd._tcp.local."]
+}
