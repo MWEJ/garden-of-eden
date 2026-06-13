@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	"gopkg.in/yaml.v3"
@@ -27,11 +28,22 @@ type CameraConfig struct {
 	IntervalSeconds int    `yaml:"interval_seconds"`
 }
 
+type WaterConfig struct {
+	LowCM float64 `yaml:"low_cm"` // 0 disables the interlock
+}
+
+type OverTempConfig struct {
+	CutLight bool `yaml:"cut_light"`
+}
+
 type Config struct {
-	HTTP       HTTPConfig   `yaml:"http"`
-	Device     DeviceConfig `yaml:"device"`
-	Camera     CameraConfig `yaml:"camera"`
-	SensorType string       `yaml:"sensor_type"`
+	HTTP       HTTPConfig     `yaml:"http"`
+	Device     DeviceConfig   `yaml:"device"`
+	Camera     CameraConfig   `yaml:"camera"`
+	SensorType string         `yaml:"sensor_type"`
+	Schedules  Schedules      `yaml:"schedules"`
+	Water      WaterConfig    `yaml:"water"`
+	OverTemp   OverTempConfig `yaml:"overtemp"`
 }
 
 func defaults() Config {
@@ -78,6 +90,37 @@ func applyEnv(c *Config) {
 	envStr(&c.Camera.Resolution, "CAMERA_RESOLUTION")
 	envInt(&c.Camera.IntervalSeconds, "IMAGE_INTERVAL_SECONDS")
 	envStr(&c.SensorType, "SENSOR_TYPE")
+	envFloat(&c.Water.LowCM, "WATER_LOW_CM")
+}
+
+func (c Config) Save(path string) error {
+	data, err := yaml.Marshal(c)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.yaml")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Chmod(tmpName, 0o644); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return nil
 }
 
 func envStr(dst *string, key string) {
@@ -90,6 +133,14 @@ func envInt(dst *int, key string) {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			*dst = n
+		}
+	}
+}
+
+func envFloat(dst *float64, key string) {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil {
+			*dst = f
 		}
 	}
 }

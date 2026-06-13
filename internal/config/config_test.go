@@ -69,3 +69,28 @@ func TestIntervalSecondsClampedPositive(t *testing.T) {
 		t.Errorf("IntervalSeconds = %d, want > 0 (clamped)", c.Camera.IntervalSeconds)
 	}
 }
+
+func TestAtomicSaveRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Schedules.Light = Schedule{Enabled: true, Entries: []ScheduleEntry{{At: "06:00", Action: "on", Brightness: 70}}}
+	c.Water.LowCM = 12.5
+	c.OverTemp.CutLight = true
+	if err := c.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	got, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Schedules.Light.Enabled || len(got.Schedules.Light.Entries) != 1 {
+		t.Errorf("round-trip lost schedule: %+v", got.Schedules.Light)
+	}
+	if got.Water.LowCM != 12.5 || !got.OverTemp.CutLight {
+		t.Errorf("round-trip lost water/overtemp: water=%+v overtemp=%+v", got.Water, got.OverTemp)
+	}
+}
