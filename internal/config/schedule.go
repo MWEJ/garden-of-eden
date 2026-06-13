@@ -41,6 +41,20 @@ func minutes(at string) (int, error) {
 	return h*60 + m, nil
 }
 
+// Validate checks that every entry has a well-formed HH:MM time and a known
+// action ("on" or "off").
+func (s Schedule) Validate() error {
+	for _, e := range s.Entries {
+		if _, err := minutes(e.At); err != nil {
+			return fmt.Errorf("entry at %q: %w", e.At, err)
+		}
+		if e.Action != "on" && e.Action != "off" {
+			return fmt.Errorf("entry at %q: action must be on|off", e.At)
+		}
+	}
+	return nil
+}
+
 type parsedEntry struct {
 	min   int
 	entry ScheduleEntry

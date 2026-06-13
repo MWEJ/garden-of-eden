@@ -45,6 +45,23 @@ func TestDueEntries(t *testing.T) {
 	}
 }
 
+func TestValidate(t *testing.T) {
+	good := Schedule{Entries: []ScheduleEntry{{At: "06:00", Action: "on", Brightness: 70}}}
+	if err := good.Validate(); err != nil {
+		t.Errorf("good schedule: unexpected error %v", err)
+	}
+
+	badTime := Schedule{Entries: []ScheduleEntry{{At: "25:99", Action: "on"}}}
+	if err := badTime.Validate(); err == nil {
+		t.Error("bad time \"25:99\": expected error, got nil")
+	}
+
+	badAction := Schedule{Entries: []ScheduleEntry{{At: "06:00", Action: "blink"}}}
+	if err := badAction.Validate(); err == nil {
+		t.Error("bad action \"blink\": expected error, got nil")
+	}
+}
+
 func TestDueBetweenMidnightCrossing(t *testing.T) {
 	s := Schedule{Enabled: true, Entries: []ScheduleEntry{
 		{At: "00:00", Action: "off"},
