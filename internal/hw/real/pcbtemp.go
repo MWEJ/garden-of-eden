@@ -1,6 +1,8 @@
 package real
 
 import (
+	"fmt"
+
 	"github.com/iot-root/garden-of-eden/internal/hw"
 	"github.com/warthog618/go-gpiocdev"
 )
@@ -20,6 +22,21 @@ type PCT2075 struct {
 
 func NewPCT2075(bus *Bus, chip string, alertGPIO int) (*PCT2075, error) {
 	p := &PCT2075{bus: bus, addr: 0x48}
+
+	// Configure to match the Python predecessor: OS pin active-HIGH (config
+	// bit 2), comparator mode, Tos=36°C, Thyst=34°C. Tos/Thyst are
+	// left-justified (high bits): 36°C -> 0x2400, 34°C -> 0x2200. Done before
+	// requesting the GPIO so an absent sensor fails fast without leaking a line.
+	if err := bus.Tx(p.addr, []byte{0x01, 0x04}, nil); err != nil { // Conf: OS_POL active-high
+		return nil, fmt.Errorf("pct2075 config: %w", err)
+	}
+	if err := bus.Tx(p.addr, []byte{0x03, 0x24, 0x00}, nil); err != nil { // Tos = 36°C
+		return nil, fmt.Errorf("pct2075 Tos: %w", err)
+	}
+	if err := bus.Tx(p.addr, []byte{0x02, 0x22, 0x00}, nil); err != nil { // Thyst = 34°C
+		return nil, fmt.Errorf("pct2075 Thyst: %w", err)
+	}
+
 	if alertGPIO >= 0 {
 		line, err := gpiocdev.RequestLine(chip, alertGPIO, gpiocdev.AsInput)
 		if err != nil {
@@ -46,7 +63,15 @@ func (p *PCT2075) OverTemp() (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	return v == 1, nil // active-high alert
+	return v == 1, nil // OS polarity set active-high in NewPCT2075
+}
+
+// Close releases the alert GPIO line, if any.
+func (p *PCT2075) Close() error {
+	if p.alertLine != nil {
+		return p.alertLine.Close()
+	}
+	return nil
 }
 
 var _ hw.PCBTempSensor = (*PCT2075)(nil)
