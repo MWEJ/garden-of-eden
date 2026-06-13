@@ -21,4 +21,10 @@ func TestINA219ShuntAndCurrent(t *testing.T) {
 	if got := currentA(v, 0.08); math.Abs(got-0.125) > 1e-9 {
 		t.Errorf("currentA = %v, want 0.125", got)
 	}
+	if got := shuntVoltageV(-500); math.Abs(got-(-0.005)) > 1e-9 {
+		t.Errorf("shuntVoltageV(-500) = %v, want -0.005", got)
+	}
+	if got := currentA(-0.005, 0.08); math.Abs(got-(-0.0625)) > 1e-9 {
+		t.Errorf("currentA(neg) = %v, want -0.0625", got)
+	}
 }

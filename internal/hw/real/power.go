@@ -4,6 +4,8 @@ import (
 	"github.com/iot-root/garden-of-eden/internal/hw"
 )
 
+// busVoltageV decodes the INA219 bus-voltage register. Bits [2:0] are CNVR/OVF
+// status flags, not voltage data, so >>3 discards them (no precision loss).
 func busVoltageV(raw uint16) float64             { return float64(raw>>3) * 0.004 }
 func shuntVoltageV(raw int16) float64            { return float64(raw) * 0.00001 } // 10µV LSB
 func currentA(shuntV, shuntOhms float64) float64 { return shuntV / shuntOhms }
@@ -39,7 +41,7 @@ func (s *INA219) Read() (hw.PowerReading, error) {
 	cur := currentA(sv, s.shuntOhms)
 	return hw.PowerReading{
 		BusVoltage:   round2(bv),
-		ShuntVoltage: sv,
+		ShuntVoltage: sv, // full precision (diagnostic); others round2'd for display
 		Current:      round2(cur),
 		Power:        round2(bv * cur),
 	}, nil

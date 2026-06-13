@@ -2,6 +2,7 @@ package real
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -122,6 +123,6 @@ func medianOrErr(data []float64) (float64, error) {
 	return round2(median(data)), nil
 }
 
-func round2(f float64) float64 { return float64(int(f*100+0.5)) / 100 }
+func round2(f float64) float64 { return math.Round(f*100) / 100 }
 
 var _ hw.DistanceSensor = (*HCSR04)(nil)
