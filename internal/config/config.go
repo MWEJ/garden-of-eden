@@ -60,9 +60,10 @@ func defaults() Config {
 	}
 }
 
-// Load reads defaults, overlays the YAML file at path (if non-empty), then
-// applies environment-variable overrides.
-func Load(path string) (Config, error) {
+// LoadFileOnly reads defaults overlaid with the YAML file at path (if any),
+// WITHOUT applying environment-variable overrides. Use this as the baseline
+// when saving, so runtime env/flag overrides are never written back to disk.
+func LoadFileOnly(path string) (Config, error) {
 	c := defaults()
 	if path != "" {
 		data, err := os.ReadFile(path)
@@ -72,6 +73,19 @@ func Load(path string) (Config, error) {
 		if err := yaml.Unmarshal(data, &c); err != nil {
 			return Config{}, fmt.Errorf("parse config: %w", err)
 		}
+	}
+	if c.Camera.IntervalSeconds <= 0 {
+		c.Camera.IntervalSeconds = 3600
+	}
+	return c, nil
+}
+
+// Load reads defaults, overlays the YAML file at path (if non-empty), then
+// applies environment-variable overrides.
+func Load(path string) (Config, error) {
+	c, err := LoadFileOnly(path)
+	if err != nil {
+		return Config{}, err
 	}
 	applyEnv(&c)
 	if c.Camera.IntervalSeconds <= 0 {

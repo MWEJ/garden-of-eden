@@ -70,6 +70,31 @@ func TestIntervalSecondsClampedPositive(t *testing.T) {
 	}
 }
 
+func TestLoadFileOnlyIgnoresEnv(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("http:\n  port: 1234\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HTTP_PORT", "9999")
+
+	fc, err := LoadFileOnly(path)
+	if err != nil {
+		t.Fatalf("LoadFileOnly: %v", err)
+	}
+	if fc.HTTP.Port != 1234 { // env ignored, file value preserved
+		t.Errorf("LoadFileOnly port = %d, want 1234 (env must be ignored)", fc.HTTP.Port)
+	}
+
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.HTTP.Port != 9999 { // env applied at runtime
+		t.Errorf("Load port = %d, want 9999 (env must be applied)", c.HTTP.Port)
+	}
+}
+
 func TestAtomicSaveRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.yaml")
