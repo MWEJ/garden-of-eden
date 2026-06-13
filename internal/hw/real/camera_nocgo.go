@@ -2,7 +2,11 @@
 
 package real
 
-import "fmt"
+import (
+	"fmt"
+
+	"github.com/iot-root/garden-of-eden/internal/hw"
+)
 
 // V4L2Camera is a stub used when CGO is disabled (e.g. cross-compile with
 // CGO_ENABLED=0). The camera is not available in that configuration.
@@ -15,3 +19,5 @@ func NewV4L2Camera(_, _ string) (*V4L2Camera, error) {
 func (c *V4L2Camera) Capture() ([]byte, error) {
 	return nil, fmt.Errorf("camera unavailable: built without CGO")
 }
+
+var _ hw.Camera = (*V4L2Camera)(nil)
