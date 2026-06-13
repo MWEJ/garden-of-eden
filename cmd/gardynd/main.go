@@ -14,6 +14,7 @@ import (
 	"github.com/iot-root/garden-of-eden/internal/httpapi"
 	"github.com/iot-root/garden-of-eden/internal/hw"
 	"github.com/iot-root/garden-of-eden/internal/hw/mock"
+	"github.com/iot-root/garden-of-eden/internal/hw/real"
 	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
@@ -36,7 +37,12 @@ func main() {
 	case "mock":
 		devs = mock.New()
 	case "real":
-		log.Fatalf("real hardware backend not implemented until Plan 2; run with --hw=mock")
+		d, cleanup, herr := real.New(cfg)
+		if herr != nil {
+			log.Fatalf("hardware init: %v", herr)
+		}
+		devs = d
+		defer cleanup()
 	default:
 		log.Fatalf("unknown --hw value %q", *hwMode)
 	}
@@ -47,7 +53,7 @@ func main() {
 	defer c.Stop()
 
 	addr := fmt.Sprintf(":%d", cfg.HTTP.Port)
-	server := &http.Server{Addr: addr, Handler: httpapi.Handler(c, st)}
+	server := &http.Server{Addr: addr, Handler: httpapi.HandlerWithSensors(c, st, devs)}
 	go func() {
 		log.Printf("REST listening on %s", addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

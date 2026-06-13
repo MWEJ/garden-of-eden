@@ -4,9 +4,11 @@ package httpapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/iot-root/garden-of-eden/internal/core"
+	"github.com/iot-root/garden-of-eden/internal/hw"
 	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
@@ -69,4 +71,63 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
+}
+
+// sensorMux returns the base control mux plus read-only on-demand sensor GET
+// routes (parity with the old Flask API). Returns *http.ServeMux so later plans
+// can extend it. Routes are only registered for sensors that are present.
+func sensorMux(c *core.Core, st *state.Store, d hw.Devices) *http.ServeMux {
+	mux := baseMux(c, st)
+
+	if d.Distance != nil {
+		mux.HandleFunc("GET /distance", func(w http.ResponseWriter, _ *http.Request) {
+			v, err := d.Distance.MeasureCM()
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]float64{"distance": v})
+		})
+	}
+	if d.Env != nil {
+		mux.HandleFunc("GET /temperature", func(w http.ResponseWriter, _ *http.Request) {
+			t, _, err := d.Env.Read()
+			sensorFloat(w, "temperature", t, err)
+		})
+		mux.HandleFunc("GET /humidity", func(w http.ResponseWriter, _ *http.Request) {
+			_, h, err := d.Env.Read()
+			sensorFloat(w, "humidity", h, err)
+		})
+	}
+	if d.PCBTemp != nil {
+		mux.HandleFunc("GET /pcb-temp", func(w http.ResponseWriter, _ *http.Request) {
+			t, err := d.PCBTemp.Temperature()
+			sensorFloat(w, "pcb-temp", t, err)
+		})
+	}
+	if d.Power != nil {
+		mux.HandleFunc("GET /pump/stats", func(w http.ResponseWriter, _ *http.Request) {
+			r, err := d.Power.Read()
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, r)
+		})
+	}
+	return mux
+}
+
+func sensorFloat(w http.ResponseWriter, key string, v float64, err error) {
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{key: fmt.Sprintf("%.2f", v)})
+}
+
+// HandlerWithSensors is the control + sensor-read API (Plan 3 supersedes it
+// with the full handler).
+func HandlerWithSensors(c *core.Core, st *state.Store, d hw.Devices) http.Handler {
+	return sensorMux(c, st, d)
 }

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/iot-root/garden-of-eden/internal/core"
+	"github.com/iot-root/garden-of-eden/internal/hw"
 	"github.com/iot-root/garden-of-eden/internal/hw/mock"
 	"github.com/iot-root/garden-of-eden/internal/state"
 )
@@ -64,5 +65,35 @@ func TestBadBrightnessRejected(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/light/brightness", strings.NewReader(`{"value":150}`)))
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestDistanceRoute(t *testing.T) {
+	st := state.New()
+	devs := mock.New()
+	c := core.New(devs, st)
+	go c.Run()
+	defer c.Stop()
+	h := sensorMux(c, st, devs)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/distance", nil))
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "distance") {
+		t.Errorf("distance route: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSensorRouteAbsentWhenNil(t *testing.T) {
+	st := state.New()
+	devs := hw.Devices{Light: &mock.Light{}, Pump: &mock.Pump{}} // sensors deliberately nil
+	c := core.New(devs, st)
+	go c.Run()
+	defer c.Stop()
+	h := sensorMux(c, st, devs)
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/distance", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("nil distance sensor: route should be absent (404), got %d", rec.Code)
 	}
 }
