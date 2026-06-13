@@ -532,3 +532,24 @@ Using `gpiozero` to leverage `pigpio` daemon which is hardware driven and more e
     ├── test_light.py
     └── test_pump.py
 ```
+
+## Home Assistant integration (gardyn)
+
+Install via HACS (add this repo as a custom repository, type *Integration*),
+restart Home Assistant, then **Settings → Devices & Services → Add Integration →
+Gardyn**. The Pi is auto-discovered via zeroconf, or enter its host/port (default
+5000).
+
+Edit schedules with the `gardyn.set_schedule` service, e.g.:
+```yaml
+service: gardyn.set_schedule
+data:
+  config_entry: <your gardyn entry>
+  channel: light
+  enabled: true
+  entries:
+    - { at: "06:00", action: "on", brightness: 70 }
+    - { at: "20:00", action: "off" }
+```
+Schedules run autonomously on the Gardyn; Home Assistant only edits and displays
+them.
