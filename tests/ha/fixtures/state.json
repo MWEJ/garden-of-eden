@@ -1,6 +1,7 @@
 {
   "available": true,
   "uptime_s": 100,
+  "identifier": "gardyn-xx",
   "light": {"on": true, "brightness": 70},
   "pump": {"on": false, "speed": 100},
   "sensors": {
