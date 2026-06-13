@@ -137,13 +137,17 @@ internal/httpapi/            REST handlers (control, /state, /schedules, /camera
 internal/discovery/          optional zeroconf advertiser (_gardynd._tcp)
 ```
 
-### 4.3 Key libraries (all pure Go, CGO-free)
+### 4.3 Key libraries
 
-- `github.com/warthog618/go-gpiocdev` — GPIO lines + event timestamps.
+- `github.com/warthog618/go-gpiocdev` — GPIO lines + event timestamps (pure Go).
 - Kernel `pwm` sysfs for the light (one-time `dtoverlay=pwm` in config.txt).
-- `periph.io/x/conn` + `/dev/i2c-1` — I2C sensors.
-- `github.com/vladimirvivien/go4vl` — V4L2 camera capture.
-- `github.com/grandcat/zeroconf` — optional mDNS advertisement.
+- `periph.io/x/conn` + `/dev/i2c-1` — I2C sensors (pure Go).
+- `github.com/vladimirvivien/go4vl` — V4L2 camera capture. **Requires CGo**, so
+  it is compiled in only under a `//go:build cgo` tag; the default static
+  `CGO_ENABLED=0` ARMv6 binary builds with a no-camera stub instead (cameras
+  degrade to nil). A pure-Go V4L2 rewrite is a planned follow-up (see §9) so the
+  static binary can carry cameras without CGo.
+- `github.com/grandcat/zeroconf` — optional mDNS advertisement (pure Go).
 - Standard library `net/http` for the API. No MQTT dependency.
 
 ### 4.4 Concurrency model — single writer + snapshot store
@@ -273,3 +277,8 @@ entities unavailable when a poll fails or the service is down (its
   as entities, and provides schedule editing via a `set_schedule` service action
   backed by `PUT /schedules/{channel}`. Config flow + optional zeroconf setup.
   Separate spec.
+- **Pure-Go V4L2 camera capture** — replace the CGo-dependent `go4vl` with a
+  pure-Go V4L2 implementation (raw ioctls via `golang.org/x/sys/unix`) so the
+  default static `CGO_ENABLED=0` ARMv6 binary can capture camera frames without
+  a CGo toolchain. Until then, cameras require a CGo build (the `//go:build cgo`
+  path); the static binary ships the no-camera stub.
