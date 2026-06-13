@@ -1,0 +1,19 @@
+[Unit]
+Description=gardynd — Gardyn controller (Go)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=gardyn
+ExecStart=/usr/local/bin/gardynd --hw=real --config /etc/gardynd/config.yaml
+Restart=always
+RestartSec=3
+# Hardware access: GPIO (gpiochip), I2C, PWM sysfs, V4L2 cameras.
+SupplementaryGroups=gpio i2c video
+# periph.io host.Init() memory-maps Pi peripherals via /dev/gpiomem (and falls
+# back to /dev/mem), so the raw-I/O capability is required for sensor init. If
+# on-device testing shows host.Init() succeeds without it, this line can be dropped.
+AmbientCapabilities=CAP_SYS_RAWIO
+
+[Install]
+WantedBy=multi-user.target
