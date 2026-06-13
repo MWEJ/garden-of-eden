@@ -1,0 +1,15 @@
+{
+  "available": true,
+  "uptime_s": 100,
+  "identifier": "gardyn-xx",
+  "light": {"on": true, "brightness": 70},
+  "pump": {"on": false, "speed": 100},
+  "sensors": {
+    "temperature_c": 22.5, "humidity_pct": 55.0,
+    "pcb_temp_c": 31.2, "water_level_cm": 7.4,
+    "pump": {"bus_voltage": 12.0, "current": 0.5, "power": 6.0}
+  },
+  "water": {"low_threshold_cm": 10.0, "low": false},
+  "overtemp": false,
+  "schedules": {"light": {"enabled": true}, "pump": {"enabled": true}}
+}

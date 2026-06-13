@@ -1,0 +1,21 @@
+set_schedule:
+  fields:
+    config_entry:
+      required: true
+      selector:
+        config_entry:
+          integration: gardyn
+    channel:
+      required: true
+      selector:
+        select:
+          options: ["light", "pump"]
+    enabled:
+      required: false
+      default: true
+      selector:
+        boolean:
+    entries:
+      required: true
+      selector:
+        object:

@@ -26,6 +26,7 @@ Work in progress. We should be picking up some steam here to give the DYI commun
 - [Garden of Eden](#garden-of-eden)
   - [Project Status \& Milestones](#project-status--milestones)
   - [Table of Contents](#table-of-contents)
+  - [Running gardynd (Go service)](#running-gardynd-go-service)
   - [Getting Started](#getting-started)
     - [Prerequisites](#prerequisites)
   - [Usage](#usage)
@@ -65,9 +66,65 @@ Work in progress. We should be picking up some steam here to give the DYI commun
     - [GPIO](#gpio)
   - [Folder Structure](#folder-structure)
 
+## Running gardynd (Go service)
+
+gardynd replaces the Python Flask + MQTT services with a single static binary
+exposing one local REST API — no broker, no pigpiod, no fswebcam, no Python
+venv. **Nothing external is required at runtime.** Home Assistant connects via
+the dedicated gardynd custom integration (separate repo/release).
+
+### One-time Pi setup
+1. Enable I2C and hardware PWM in `/boot/config.txt` (or
+   `/boot/firmware/config.txt` on Bookworm):
+   ```
+   dtparam=i2c_arm=on
+   dtoverlay=pwm
+   ```
+   Reboot.
+2. Ensure the `gardyn` user is in the `gpio`, `i2c`, and `video` groups.
+
+### Install
+
+> The release ships only the `gardynd-armv6` binary. `config.example.yaml` and
+> `services/etc/systemd/system/gardynd.service` live in this repo — clone it on
+> the Pi (or download those two files) to follow the steps below.
+
+1. Download `gardynd-armv6` from the latest release (or `make build-pi`) and
+   copy it to `/usr/local/bin/gardynd`.
+2. Create the config directory and copy the example, then edit it
+   (`identifier`, schedules, optional water threshold):
+   ```
+   sudo mkdir -p /etc/gardynd
+   sudo cp config.example.yaml /etc/gardynd/config.yaml
+   ```
+3. Install the service:
+   ```
+   sudo cp services/etc/systemd/system/gardynd.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now gardynd
+   ```
+4. Verify: `journalctl -u gardynd -f` and `curl localhost:5000/state`. Then add
+   the gardynd integration in Home Assistant (auto-discovered via zeroconf, or
+   enter the Pi's host/port).
+
+### Side-by-side bring-up (recommended before cutover)
+Run gardynd on an alternate HTTP port while the Python service still runs:
+```
+gardynd --hw=real --config /etc/gardynd/config.yaml --http-port 5001
+```
+Exercise control + `curl localhost:5001/state`, then switch over by stopping the
+old `mqtt.service` and running gardynd on the default port.
+
+### Config / env compatibility
+Existing `.env` variables (`MQTT_IDENTIFIER`, `WATER_LOW_CM`, `SENSOR_TYPE`,
+camera devices, …) still override the YAML during migration.
+
 ## Getting Started
 
 ### Prerequisites
+
+> **Deprecated:** the Python `mqtt.py`/Flask service is superseded by gardynd
+> (see "Running gardynd"). It will be removed once parity is confirmed.
 
 Start with a clean install of Linux. Use the [RaspberryPi Imager](https://www.raspberrypi.com/software/). Ensure ssh and wifi is setup. Once the image is written, pop the SDcard into the pi and ssh into it.
 
@@ -475,3 +532,24 @@ Using `gpiozero` to leverage `pigpio` daemon which is hardware driven and more e
     ├── test_light.py
     └── test_pump.py
 ```
+
+## Home Assistant integration (gardyn)
+
+Install via HACS (add this repo as a custom repository, type *Integration*),
+restart Home Assistant, then **Settings → Devices & Services → Add Integration →
+Gardyn**. The Pi is auto-discovered via zeroconf, or enter its host/port (default
+5000).
+
+Edit schedules with the `gardyn.set_schedule` service, e.g.:
+```yaml
+service: gardyn.set_schedule
+data:
+  config_entry: <your gardyn entry>
+  channel: light
+  enabled: true
+  entries:
+    - { at: "06:00", action: "on", brightness: 70 }
+    - { at: "20:00", action: "off" }
+```
+Schedules run autonomously on the Gardyn; Home Assistant only edits and displays
+them.

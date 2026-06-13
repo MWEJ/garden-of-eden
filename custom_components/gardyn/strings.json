@@ -1,0 +1,61 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": { "host": "Host", "port": "Port" }
+      },
+      "zeroconf_confirm": {
+        "description": "Set up the discovered Gardyn?"
+      }
+    },
+    "error": { "cannot_connect": "Failed to connect to gardynd" },
+    "abort": { "already_configured": "This Gardyn is already configured" }
+  },
+  "entity": {
+    "light": {
+      "light": { "name": "Light" }
+    },
+    "fan": {
+      "pump": { "name": "Pump" }
+    },
+    "sensor": {
+      "temperature": { "name": "Temperature" },
+      "humidity": { "name": "Humidity" },
+      "pcb_temp": { "name": "PCB Temperature" },
+      "water_level": { "name": "Water Level" },
+      "pump_voltage": { "name": "Pump Voltage" },
+      "pump_current": { "name": "Pump Current" },
+      "pump_power": { "name": "Pump Power" },
+      "light_schedule": { "name": "Light Schedule" },
+      "pump_schedule": { "name": "Pump Schedule" }
+    },
+    "binary_sensor": {
+      "water_low": { "name": "Water Low" },
+      "over_temp": { "name": "Over Temp" }
+    },
+    "switch": {
+      "light_schedule": { "name": "Light Schedule" },
+      "pump_schedule": { "name": "Pump Schedule" }
+    },
+    "number": {
+      "water_low_threshold": { "name": "Water Low Threshold" }
+    }
+  },
+  "options": {
+    "step": {
+      "init": { "data": { "scan_interval": "Polling interval (seconds)" } }
+    }
+  },
+  "services": {
+    "set_schedule": {
+      "name": "Set schedule",
+      "description": "Replace a channel's on-device schedule.",
+      "fields": {
+        "config_entry": { "name": "Gardyn", "description": "Target Gardyn." },
+        "channel": { "name": "Channel", "description": "light or pump." },
+        "enabled": { "name": "Enabled", "description": "Enable the schedule." },
+        "entries": { "name": "Entries", "description": "List of {at, action, brightness}." }
+      }
+    }
+  }
+}
