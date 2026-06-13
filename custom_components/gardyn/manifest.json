@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "documentation": "https://github.com/iot-root/garden-of-eden",
   "issue_tracker": "https://github.com/iot-root/garden-of-eden/issues",
-  "codeowners": [],
+  "codeowners": ["@iot-root"],
   "iot_class": "local_polling",
   "integration_type": "device",
   "config_flow": true,

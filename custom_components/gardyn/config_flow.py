@@ -16,7 +16,14 @@ from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.service_info.zeroconf import ZeroconfServiceInfo
 
 from .api import GardyndApiError, GardyndClient
-from .const import CONF_SCAN_INTERVAL, DEFAULT_PORT, DEFAULT_SCAN_INTERVAL, DOMAIN, MIN_SCAN_INTERVAL
+from .const import (
+    CONF_SCAN_INTERVAL,
+    DEFAULT_PORT,
+    DEFAULT_SCAN_INTERVAL,
+    DOMAIN,
+    MIN_SCAN_INTERVAL,
+    ZEROCONF_TYPE,
+)
 
 
 class GardynConfigFlow(ConfigFlow, domain=DOMAIN):
@@ -58,6 +65,16 @@ class GardynConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_zeroconf(self, discovery_info: ZeroconfServiceInfo) -> ConfigFlowResult:
         self._host = str(discovery_info.ip_address)
         self._port = discovery_info.port or DEFAULT_PORT
+        # gardynd advertises instance "gardynd-<identifier>"; derive the unique
+        # id from the discovery name so an already-configured device is
+        # deduplicated (and its host/port refreshed) before prompting the user.
+        instance = discovery_info.name.removesuffix(f".{ZEROCONF_TYPE}")
+        identifier = instance.removeprefix("gardynd-")
+        if identifier:
+            await self.async_set_unique_id(identifier)
+            self._abort_if_unique_id_configured(
+                updates={CONF_HOST: self._host, CONF_PORT: self._port}
+            )
         return await self.async_step_zeroconf_confirm()
 
     async def async_step_zeroconf_confirm(

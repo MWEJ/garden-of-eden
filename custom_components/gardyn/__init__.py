@@ -7,7 +7,7 @@ from datetime import timedelta
 
 import voluptuous as vol
 
-from homeassistant.config_entries import ConfigEntry
+from homeassistant.config_entries import ConfigEntry, ConfigEntryState
 from homeassistant.const import CONF_HOST, CONF_PORT
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.exceptions import HomeAssistantError
@@ -48,6 +48,8 @@ async def async_setup(hass: HomeAssistant, config) -> bool:
         entry: ConfigEntry | None = hass.config_entries.async_get_entry(entry_id)
         if entry is None or entry.domain != DOMAIN:
             raise HomeAssistantError(f"unknown gardyn config entry {entry_id}")
+        if entry.state is not ConfigEntryState.LOADED:
+            raise HomeAssistantError(f"gardyn config entry {entry_id} is not loaded")
         client = entry.runtime_data.client
         schedule = {"enabled": call.data["enabled"], "entries": call.data["entries"]}
         await client.set_schedule(call.data["channel"], schedule)

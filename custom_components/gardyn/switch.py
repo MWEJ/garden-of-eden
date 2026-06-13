@@ -32,7 +32,10 @@ class GardynScheduleSwitch(GardynEntity, SwitchEntity):
 
     @property
     def is_on(self) -> bool:
-        return bool(self.coordinator.data["schedules"][self._channel]["enabled"])
+        # Read the enabled flag from /schedules (schedules_detail) — the same
+        # source the schedule sensor uses — so the two never disagree.
+        sched = self.coordinator.data["schedules_detail"].get(self._channel, {})
+        return bool(sched.get("enabled", False))
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         await self._client.set_schedule_enabled(self._channel, True)
