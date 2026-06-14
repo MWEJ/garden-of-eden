@@ -73,3 +73,21 @@ func TestSetDeviceInfo(t *testing.T) {
 		t.Errorf("Version = %q, want %q", snap.Version, "2.1.0")
 	}
 }
+
+func TestSetWaterSensorOK(t *testing.T) {
+	s := New()
+	s.SetWater(10.0, true) // threshold=10, low=true
+	s.SetWaterSensorOK(false)
+	snap := s.Snapshot()
+	if snap.Water.SensorOK {
+		t.Errorf("SensorOK = true, want false")
+	}
+	// SetWaterSensorOK must not clobber the threshold/low set by SetWater.
+	if snap.Water.LowThresholdCM != 10.0 || !snap.Water.Low {
+		t.Errorf("SetWaterSensorOK clobbered other fields: %+v", snap.Water)
+	}
+	s.SetWaterSensorOK(true)
+	if !s.Snapshot().Water.SensorOK {
+		t.Errorf("SensorOK = false after set true")
+	}
+}

@@ -44,11 +44,13 @@ type Core struct {
 	lightLevel int
 	pumpLevel  int
 
-	cfgMu              sync.Mutex // guards runtime-tunable config: waterLowCM, pumpMaxRuntime, cutLightOnOverTemp
+	cfgMu              sync.Mutex // guards runtime-tunable config: waterLowCM, pumpMaxRuntime, cutLightOnOverTemp, blockOnSensorError
 	waterLowCM         float64
 	pumpMaxRuntime     time.Duration
 	cutLightOnOverTemp bool
+	blockOnSensorError bool
 	pumpTimer          *time.Timer // core-goroutine only
+	pumpStateFile      string      // core-goroutine only after startup
 }
 
 func New(dev hw.Devices, store *state.Store) *Core {
@@ -90,6 +92,16 @@ func (c *Core) SetCutLightOnOverTemp(b bool) {
 	c.cutLightOnOverTemp = b
 	c.cfgMu.Unlock()
 }
+func (c *Core) SetBlockOnSensorError(b bool) {
+	c.cfgMu.Lock()
+	c.blockOnSensorError = b
+	c.cfgMu.Unlock()
+}
+
+// SetPumpStateFile sets the path used to persist the pump-on start time for
+// restart-enforced failsafe. Call once at startup before the core handles any
+// pump command; thereafter it is read only on the core goroutine.
+func (c *Core) SetPumpStateFile(path string) { c.pumpStateFile = path }
 
 // waterLow returns the current threshold under cfgMu.
 func (c *Core) waterLow() float64 {
@@ -110,6 +122,13 @@ func (c *Core) cutLightOnTemp() bool {
 	c.cfgMu.Lock()
 	defer c.cfgMu.Unlock()
 	return c.cutLightOnOverTemp
+}
+
+// blockOnError returns the sensor-error fail policy under cfgMu.
+func (c *Core) blockOnError() bool {
+	c.cfgMu.Lock()
+	defer c.cfgMu.Unlock()
+	return c.blockOnSensorError
 }
 
 func (c *Core) Run() {
@@ -167,12 +186,26 @@ func (c *Core) applyPump(cmd Command) {
 		threshold := c.waterLow()
 		if threshold > 0 {
 			cm, err := c.measureDistance()
-			if err == nil && cm > threshold {
-				c.store.SetWater(threshold, true) // low=true
-				c.flashLights()
-				return
+			if err != nil {
+				// Distance read failed. Record sensor health, then apply policy.
+				c.store.SetWaterSensorOK(false)
+				if c.blockOnError() {
+					log.Printf("pump on: distance read failed, blocking (fail-closed): %v", err)
+					c.flashLights()
+					return
+				}
+				log.Printf("pump on: distance read failed, proceeding (fail-open): %v", err)
+			} else {
+				c.store.SetWaterSensorOK(true)
+				if cm > threshold {
+					c.store.SetWater(threshold, true) // low=true
+					c.store.SetWaterSensorOK(true)    // SetWater zeroes SensorOK; restore it
+					c.flashLights()
+					return
+				}
+				c.store.SetWater(threshold, false)
+				c.store.SetWaterSensorOK(true) // SetWater zeroes SensorOK; restore it
 			}
-			c.store.SetWater(threshold, false)
 		}
 		if cmd.Value > 0 {
 			c.pumpLevel = cmd.Value
@@ -181,10 +214,20 @@ func (c *Core) applyPump(cmd Command) {
 			log.Printf("pump on: %v", err)
 			return
 		}
+		if c.pumpStateFile != "" {
+			if err := writePumpState(c.pumpStateFile, time.Now()); err != nil {
+				log.Printf("pump state persist (continuing): %v", err)
+			}
+		}
 		c.armPumpFailsafe()
 		c.store.SetPump(true, c.pumpLevel)
 	case ActionOff:
 		c.disarmPumpFailsafe()
+		if c.pumpStateFile != "" {
+			if err := clearPumpState(c.pumpStateFile); err != nil {
+				log.Printf("pump state clear (continuing): %v", err)
+			}
+		}
 		if err := c.dev.Pump.Off(); err != nil {
 			log.Printf("pump off: %v", err)
 			return
@@ -247,4 +290,46 @@ func (c *Core) disarmPumpFailsafe() {
 		c.pumpTimer.Stop()
 		c.pumpTimer = nil
 	}
+}
+
+// EnforcePumpRuntime is called once at startup to re-enforce the max-runtime
+// failsafe across a crash/restart. If a persisted pump-on start time exists:
+//   - if it has already run >= maxRuntime, the pump is driven OFF, the file is
+//     cleared, and 0 is returned (caller should not arm a failsafe);
+//   - otherwise the file is left in place and the REMAINING duration is
+//     returned so the caller can arm a failsafe for that remainder.
+//
+// Returns 0 when there is no file (or it is unreadable). Best-effort: errors
+// are logged, never fatal. Must run before c.Run handles any pump command.
+//
+// Why direct device access here is safe: this runs at startup before c.Run
+// handles any pump command (no concurrent core-goroutine writer to race with),
+// so it touches the device directly rather than via the command channel,
+// avoiding a chicken-and-egg dependency on the command loop being live.
+func (c *Core) EnforcePumpRuntime(path string, maxRuntime time.Duration, now time.Time) time.Duration {
+	startedAt, ok, err := readPumpState(path)
+	if err != nil {
+		log.Printf("pump state read at startup (clearing): %v", err)
+		if cerr := clearPumpState(path); cerr != nil {
+			log.Printf("pump state clear at startup: %v", cerr)
+		}
+		return 0
+	}
+	if !ok {
+		return 0
+	}
+	if ShouldForceOff(startedAt, now, maxRuntime) {
+		log.Printf("pump state: previous run exceeded max runtime (%s); forcing pump off", maxRuntime)
+		if c.dev.Pump != nil {
+			if oerr := c.dev.Pump.Off(); oerr != nil {
+				log.Printf("pump off at startup: %v", oerr)
+			}
+		}
+		c.store.SetPump(false, c.pumpLevel)
+		if cerr := clearPumpState(path); cerr != nil {
+			log.Printf("pump state clear at startup: %v", cerr)
+		}
+		return 0
+	}
+	return maxRuntime - now.Sub(startedAt)
 }

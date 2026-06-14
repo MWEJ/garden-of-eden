@@ -34,6 +34,7 @@ type Sensors struct {
 type WaterState struct {
 	LowThresholdCM float64 `json:"low_threshold_cm"`
 	Low            bool    `json:"low"`
+	SensorOK       bool    `json:"sensor_ok"`
 }
 
 type Snapshot struct {
@@ -101,6 +102,14 @@ func (s *Store) SetPump(on bool, speed int) {
 func (s *Store) SetWater(thresholdCM float64, low bool) {
 	s.mu.Lock()
 	s.snap.Water = WaterState{LowThresholdCM: thresholdCM, Low: low}
+	s.mu.Unlock()
+}
+
+// SetWaterSensorOK records whether the last distance-sensor read succeeded,
+// without disturbing the threshold/low fields set by SetWater.
+func (s *Store) SetWaterSensorOK(ok bool) {
+	s.mu.Lock()
+	s.snap.Water.SensorOK = ok
 	s.mu.Unlock()
 }
 

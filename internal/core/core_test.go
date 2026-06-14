@@ -1,6 +1,7 @@
 package core
 
 import (
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -174,4 +175,160 @@ func TestSetWaterLowCMConcurrent(t *testing.T) {
 		}
 	}()
 	wg.Wait()
+}
+
+func TestPumpBlockedOnSensorErrorFailClosed(t *testing.T) {
+	st := state.New()
+	devs := mock.New()
+	devs.Distance.(*mock.Distance).Err = errExampleSensor
+	c := New(devs, st)
+	c.SetWaterLowCM(10.0)
+	c.SetBlockOnSensorError(true) // fail-closed
+	go c.Run()
+	defer c.Stop()
+
+	c.Submit(Command{Target: TargetPump, Action: ActionOn})
+	time.Sleep(2 * time.Second) // flashLights blocks ~1.8s
+
+	snap := st.Snapshot()
+	if snap.Pump.On {
+		t.Error("pump turned on despite sensor error (fail-closed)")
+	}
+	if snap.Water.SensorOK {
+		t.Error("water.sensor_ok should be false after a read error")
+	}
+	if devs.Pump.(*mock.Pump).Speed() != 0 {
+		t.Error("pump hardware was driven despite sensor error")
+	}
+}
+
+func TestPumpAllowedOnSensorErrorFailOpen(t *testing.T) {
+	st := state.New()
+	devs := mock.New()
+	devs.Distance.(*mock.Distance).Err = errExampleSensor
+	c := New(devs, st)
+	c.SetWaterLowCM(10.0)
+	c.SetBlockOnSensorError(false) // fail-open: pump anyway
+	go c.Run()
+	defer c.Stop()
+
+	c.Submit(Command{Target: TargetPump, Action: ActionOn})
+	for i := 0; i < 50; i++ {
+		if st.Snapshot().Pump.On {
+			if st.Snapshot().Water.SensorOK {
+				t.Error("water.sensor_ok should be false even when failing open")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("pump should have turned on (fail-open)")
+}
+
+func TestPumpSensorOKTrueOnGoodRead(t *testing.T) {
+	st := state.New()
+	devs := mock.New()
+	devs.Distance.(*mock.Distance).CM = 5.0 // <= threshold => ok, no error
+	c := New(devs, st)
+	c.SetWaterLowCM(10.0)
+	go c.Run()
+	defer c.Stop()
+
+	c.Submit(Command{Target: TargetPump, Action: ActionOn})
+	for i := 0; i < 50; i++ {
+		snap := st.Snapshot()
+		if snap.Pump.On {
+			if !snap.Water.SensorOK {
+				t.Error("water.sensor_ok should be true after a good read")
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Error("pump should have turned on")
+}
+
+var errExampleSensor = errSensorTest{}
+
+type errSensorTest struct{}
+
+func (errSensorTest) Error() string { return "mock distance sensor error" }
+
+func TestPumpOnPersistsStateOffClearsIt(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pump.json")
+	st := state.New()
+	c := New(mock.New(), st)
+	c.SetPumpStateFile(path)
+	c.SetPumpMaxRuntime(time.Hour) // long, so the failsafe does not fire mid-test
+	go c.Run()
+	defer c.Stop()
+
+	c.Submit(Command{Target: TargetPump, Action: ActionOn})
+	for i := 0; i < 50; i++ {
+		if _, ok, _ := readPumpState(path); ok {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, ok, _ := readPumpState(path); !ok {
+		t.Fatal("pump-on did not persist state file")
+	}
+
+	c.Submit(Command{Target: TargetPump, Action: ActionOff})
+	for i := 0; i < 50; i++ {
+		if _, ok, _ := readPumpState(path); !ok {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("pump-off did not clear state file")
+}
+
+func TestEnforcePumpRuntimeExpiredForcesOffAndClears(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pump.json")
+	// Simulate a crash 20 minutes ago with a 10-minute max.
+	if err := writePumpState(path, time.Now().Add(-20*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	st := state.New()
+	devs := mock.New()
+	devs.Pump.(*mock.Pump).SetSpeed(100) // pretend hardware is still running
+	c := New(devs, st)
+
+	remaining := c.EnforcePumpRuntime(path, 10*time.Minute, time.Now())
+
+	if remaining != 0 {
+		t.Errorf("remaining = %v, want 0 (expired)", remaining)
+	}
+	if devs.Pump.(*mock.Pump).Speed() != 0 {
+		t.Error("expired pump was not driven off")
+	}
+	if _, ok, _ := readPumpState(path); ok {
+		t.Error("state file not cleared after expiry")
+	}
+}
+
+func TestEnforcePumpRuntimeRemainingReturnsRemainder(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pump.json")
+	// Started 3 minutes ago with a 10-minute max => ~7 min remaining.
+	if err := writePumpState(path, time.Now().Add(-3*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	c := New(mock.New(), state.New())
+	remaining := c.EnforcePumpRuntime(path, 10*time.Minute, time.Now())
+	if remaining <= 6*time.Minute || remaining > 7*time.Minute {
+		t.Errorf("remaining = %v, want ~7m", remaining)
+	}
+	// File must remain so a later disarm/clear path can remove it.
+	if _, ok, _ := readPumpState(path); !ok {
+		t.Error("state file cleared while still within max runtime")
+	}
+}
+
+func TestEnforcePumpRuntimeNoFileReturnsZero(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "absent.json")
+	c := New(mock.New(), state.New())
+	if got := c.EnforcePumpRuntime(path, 10*time.Minute, time.Now()); got != 0 {
+		t.Errorf("remaining = %v, want 0 when no file", got)
+	}
 }

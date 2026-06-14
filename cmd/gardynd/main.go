@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -62,12 +63,23 @@ func main() {
 	st.SetDeviceInfo(cfg.Device.Identifier, cfg.Device.Model, cfg.Device.Version)
 	c := core.New(devs, st)
 	go c.Run()
-	defer c.Stop()
 
 	// Core runtime config (setters are mutex-guarded, safe post-Run).
 	c.SetWaterLowCM(cfg.Water.LowCM)
-	c.SetPumpMaxRuntime(10 * time.Minute)
+	c.SetPumpMaxRuntime(time.Duration(cfg.Pump.MaxRuntimeSeconds) * time.Second)
 	c.SetCutLightOnOverTemp(cfg.OverTemp.CutLight)
+	c.SetBlockOnSensorError(cfg.Water.BlockOnSensorError)
+	c.SetPumpStateFile(cfg.Pump.StateFile)
+
+	// Restart-enforced failsafe: if a previous run crashed while the pump was on,
+	// enforce the remaining max-runtime (or force off if already expired).
+	maxRT := time.Duration(cfg.Pump.MaxRuntimeSeconds) * time.Second
+	if remaining := c.EnforcePumpRuntime(cfg.Pump.StateFile, maxRT, time.Now()); remaining > 0 {
+		log.Printf("pump was running before restart; arming failsafe for remaining %s", remaining)
+		time.AfterFunc(remaining, func() {
+			c.Submit(core.Command{Target: core.TargetPump, Action: core.ActionOff})
+		})
+	}
 
 	// Schedules: live copy guarded by schedMu; persisted atomically to the
 	// config file (when one was supplied).
@@ -122,7 +134,6 @@ func main() {
 
 	sched := core.NewScheduler(c, getSchedules)
 	go sched.Run()
-	defer sched.Stop()
 
 	// Over-temp monitor: the publisher reads PCBTemp.OverTemp() each cycle and
 	// forwards it here, which submits to the single-writer core.
@@ -138,23 +149,31 @@ func main() {
 	pub := publish.New(devs, st, frames, time.Duration(cfg.TelemetryIntervalSeconds)*time.Second, onOverTemp)
 	go pub.Run()
 	go pub.RunCameras(time.Duration(cfg.Camera.IntervalSeconds) * time.Second)
-	defer pub.Stop()
 
+	buttonDone := make(chan struct{})
 	if devs.Button != nil {
+		events := devs.Button.Events()
 		go func() {
-			for ev := range devs.Button.Events() {
-				switch ev {
-				case hw.SinglePress:
-					c.Submit(core.Command{Target: core.TargetLight, Action: core.ActionOn})
-				case hw.DoublePress:
-					c.Submit(core.Command{Target: core.TargetPump, Action: core.ActionOn})
+			for {
+				select {
+				case <-buttonDone:
+					return
+				case ev, ok := <-events:
+					if !ok {
+						return
+					}
+					switch ev {
+					case hw.SinglePress:
+						c.Submit(core.Command{Target: core.TargetLight, Action: core.ActionOn})
+					case hw.DoublePress:
+						c.Submit(core.Command{Target: core.TargetPump, Action: core.ActionOn})
+					}
 				}
 			}
 		}()
 	}
 
 	stop := discovery.Advertise("gardynd-"+cfg.Device.Identifier, cfg.HTTP.Port)
-	defer stop()
 
 	deps := httpapi.ControlDeps{
 		GetSchedules:       getSchedules,
@@ -176,4 +195,48 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	log.Printf("shutting down")
+
+	// 1. Stop accepting new HTTP requests and drain in-flight ones, so no late
+	//    request can turn the pump back on after we drive it off.
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(shutdownCtx); err != nil {
+		log.Printf("http shutdown: %v", err)
+	}
+
+	// 2. Stop the button goroutine so it cannot submit a pump-on after this.
+	close(buttonDone)
+
+	// 3. Stop the scheduler so a minute-boundary tick cannot re-drive the pump.
+	sched.Stop()
+
+	// 4. Drive the pump OFF and wait for the core to apply it. PWM hardware holds
+	//    its last duty cycle across process exit, so a clean exit MUST turn the
+	//    pump off explicitly. This also clears the persisted pump-state file via
+	//    applyPump's ActionOff path.
+	if !submitAndWaitPumpOff(c, st, 3*time.Second) {
+		log.Printf("warning: pump did not confirm OFF within timeout")
+	}
+
+	// 5. Stop the publishers and core, then withdraw discovery.
+	pub.Stop()
+	c.Stop()
+	stop()
+}
+
+// submitAndWaitPumpOff submits a pump-OFF command and waits until the snapshot
+// confirms the pump is off (or the timeout elapses). Reuses the single-writer
+// command channel rather than touching the device directly, so the off goes
+// through the same applyPump path that disarms the failsafe and clears the
+// persisted pump-state file. Returns true if confirmed off.
+func submitAndWaitPumpOff(c *core.Core, st *state.Store, timeout time.Duration) bool {
+	c.Submit(core.Command{Target: core.TargetPump, Action: core.ActionOff})
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if !st.Snapshot().Pump.On {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return !st.Snapshot().Pump.On
 }

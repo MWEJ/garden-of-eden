@@ -29,7 +29,21 @@ type CameraConfig struct {
 }
 
 type WaterConfig struct {
-	LowCM float64 `yaml:"low_cm"` // 0 disables the interlock
+	LowCM              float64 `yaml:"low_cm"` // 0 disables the interlock
+	BlockOnSensorError bool    `yaml:"block_on_sensor_error"`
+	// BlockOnSensorError, when true (default), refuses to start the pump if the
+	// distance sensor errors while the interlock is enabled (fail-closed: a
+	// dry-run guard that cannot read the level should not run the pump). Set
+	// false to fail-open and pump anyway when the sensor is unreadable.
+}
+
+type PumpConfig struct {
+	// MaxRuntimeSeconds bounds a single continuous pump run; 0 disables the
+	// failsafe. Default 600 (10 minutes).
+	MaxRuntimeSeconds int `yaml:"max_runtime_seconds"`
+	// StateFile persists the pump-on start time so max-runtime can be enforced
+	// across a crash/restart (the in-process timer dies with the process).
+	StateFile string `yaml:"state_file"`
 }
 
 type OverTempConfig struct {
@@ -43,6 +57,7 @@ type Config struct {
 	SensorType               string         `yaml:"sensor_type"`
 	Schedules                Schedules      `yaml:"schedules"`
 	Water                    WaterConfig    `yaml:"water"`
+	Pump                     PumpConfig     `yaml:"pump"`
 	OverTemp                 OverTempConfig `yaml:"overtemp"`
 	TelemetryIntervalSeconds int            `yaml:"telemetry_interval_seconds"`
 }
@@ -58,6 +73,8 @@ func defaults() Config {
 			IntervalSeconds: 3600,
 		},
 		SensorType:               "AM2320",
+		Water:                    WaterConfig{BlockOnSensorError: true},
+		Pump:                     PumpConfig{MaxRuntimeSeconds: 600, StateFile: "/run/gardynd/pump.json"},
 		TelemetryIntervalSeconds: 30,
 	}
 }
@@ -110,6 +127,9 @@ func applyEnv(c *Config) {
 	envInt(&c.Camera.IntervalSeconds, "IMAGE_INTERVAL_SECONDS")
 	envStr(&c.SensorType, "SENSOR_TYPE")
 	envFloat(&c.Water.LowCM, "WATER_LOW_CM")
+	envBool(&c.Water.BlockOnSensorError, "WATER_BLOCK_ON_SENSOR_ERROR")
+	envInt(&c.Pump.MaxRuntimeSeconds, "PUMP_MAX_RUNTIME_SECONDS")
+	envStr(&c.Pump.StateFile, "PUMP_STATE_FILE")
 	envInt(&c.TelemetryIntervalSeconds, "TELEMETRY_INTERVAL_SECONDS")
 }
 
@@ -161,6 +181,14 @@ func envFloat(dst *float64, key string) {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		if f, err := strconv.ParseFloat(v, 64); err == nil {
 			*dst = f
+		}
+	}
+}
+
+func envBool(dst *bool, key string) {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			*dst = b
 		}
 	}
 }

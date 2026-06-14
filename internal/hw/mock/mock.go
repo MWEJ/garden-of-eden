@@ -45,9 +45,15 @@ func (p *Pump) SetSpeed(pct int) error {
 func (p *Pump) Speed() int { p.mu.Lock(); defer p.mu.Unlock(); return p.pct }
 func (p *Pump) Off() error { return p.SetSpeed(0) }
 
-type Distance struct{ CM float64 }
+type Distance struct {
+	CM  float64
+	Err error
+}
 
 func (d *Distance) MeasureCM() (float64, error) {
+	if d.Err != nil {
+		return 0, d.Err
+	}
 	if d.CM == 0 {
 		return 7.5, nil
 	}

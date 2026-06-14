@@ -1,6 +1,9 @@
 package mock
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 func TestLightBrightnessClamp(t *testing.T) {
 	l := &Light{}
@@ -66,5 +69,28 @@ func TestMockSensors(t *testing.T) {
 	}
 	if img, err := d.UpperCamera.Capture(); err != nil || len(img) == 0 {
 		t.Errorf("camera capture = %v bytes, err %v", len(img), err)
+	}
+}
+
+func TestDistanceReturnsErrWhenSet(t *testing.T) {
+	sentinel := errors.New("sensor offline")
+	d := &Distance{Err: sentinel}
+	cm, err := d.MeasureCM()
+	if err != sentinel {
+		t.Errorf("err = %v, want %v", err, sentinel)
+	}
+	if cm != 0 {
+		t.Errorf("cm = %v, want 0 on error", cm)
+	}
+}
+
+func TestDistanceNoErrByDefault(t *testing.T) {
+	d := &Distance{CM: 5.0}
+	cm, err := d.MeasureCM()
+	if err != nil {
+		t.Errorf("err = %v, want nil", err)
+	}
+	if cm != 5.0 {
+		t.Errorf("cm = %v, want 5.0", cm)
 	}
 }

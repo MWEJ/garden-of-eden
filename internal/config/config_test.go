@@ -151,3 +151,59 @@ func TestTelemetryIntervalClamped(t *testing.T) {
 		t.Errorf("TelemetryIntervalSeconds = %d after clamp, want >= 1", c.TelemetryIntervalSeconds)
 	}
 }
+
+func TestPumpMaxRuntimeDefault(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pump.MaxRuntimeSeconds != 600 {
+		t.Errorf("Pump.MaxRuntimeSeconds default = %d, want 600", c.Pump.MaxRuntimeSeconds)
+	}
+}
+
+func TestPumpStateFileDefault(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pump.StateFile != "/run/gardynd/pump.json" {
+		t.Errorf("Pump.StateFile default = %q, want /run/gardynd/pump.json", c.Pump.StateFile)
+	}
+}
+
+func TestPumpMaxRuntimeEnvOverride(t *testing.T) {
+	t.Setenv("PUMP_MAX_RUNTIME_SECONDS", "120")
+	t.Setenv("PUMP_STATE_FILE", "/tmp/pump.json")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Pump.MaxRuntimeSeconds != 120 {
+		t.Errorf("Pump.MaxRuntimeSeconds = %d, want 120", c.Pump.MaxRuntimeSeconds)
+	}
+	if c.Pump.StateFile != "/tmp/pump.json" {
+		t.Errorf("Pump.StateFile = %q, want /tmp/pump.json", c.Pump.StateFile)
+	}
+}
+
+func TestBlockOnSensorErrorDefaultTrue(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Water.BlockOnSensorError {
+		t.Errorf("Water.BlockOnSensorError default = false, want true (fail-closed)")
+	}
+}
+
+func TestBlockOnSensorErrorEnvOverride(t *testing.T) {
+	t.Setenv("WATER_BLOCK_ON_SENSOR_ERROR", "false")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Water.BlockOnSensorError {
+		t.Errorf("Water.BlockOnSensorError = true after env=false, want false")
+	}
+}
