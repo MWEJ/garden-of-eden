@@ -59,6 +59,7 @@ func main() {
 	}
 
 	st := state.New()
+	st.SetDeviceInfo(cfg.Device.Identifier, cfg.Device.Model, cfg.Device.Version)
 	c := core.New(devs, st)
 	go c.Run()
 	defer c.Stop()
@@ -134,7 +135,7 @@ func main() {
 	}
 
 	frames := state.NewFrames()
-	pub := publish.New(devs, st, frames, 30*time.Minute, onOverTemp)
+	pub := publish.New(devs, st, frames, time.Duration(cfg.TelemetryIntervalSeconds)*time.Second, onOverTemp)
 	go pub.Run()
 	go pub.RunCameras(time.Duration(cfg.Camera.IntervalSeconds) * time.Second)
 	defer pub.Stop()

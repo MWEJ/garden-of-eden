@@ -37,13 +37,14 @@ type OverTempConfig struct {
 }
 
 type Config struct {
-	HTTP       HTTPConfig     `yaml:"http"`
-	Device     DeviceConfig   `yaml:"device"`
-	Camera     CameraConfig   `yaml:"camera"`
-	SensorType string         `yaml:"sensor_type"`
-	Schedules  Schedules      `yaml:"schedules"`
-	Water      WaterConfig    `yaml:"water"`
-	OverTemp   OverTempConfig `yaml:"overtemp"`
+	HTTP                     HTTPConfig     `yaml:"http"`
+	Device                   DeviceConfig   `yaml:"device"`
+	Camera                   CameraConfig   `yaml:"camera"`
+	SensorType               string         `yaml:"sensor_type"`
+	Schedules                Schedules      `yaml:"schedules"`
+	Water                    WaterConfig    `yaml:"water"`
+	OverTemp                 OverTempConfig `yaml:"overtemp"`
+	TelemetryIntervalSeconds int            `yaml:"telemetry_interval_seconds"`
 }
 
 func defaults() Config {
@@ -56,7 +57,8 @@ func defaults() Config {
 			Resolution:      "640x480",
 			IntervalSeconds: 3600,
 		},
-		SensorType: "AM2320",
+		SensorType:               "AM2320",
+		TelemetryIntervalSeconds: 30,
 	}
 }
 
@@ -91,6 +93,9 @@ func Load(path string) (Config, error) {
 	if c.Camera.IntervalSeconds <= 0 {
 		c.Camera.IntervalSeconds = 3600
 	}
+	if c.TelemetryIntervalSeconds < 1 {
+		c.TelemetryIntervalSeconds = 1
+	}
 	return c, nil
 }
 
@@ -105,6 +110,7 @@ func applyEnv(c *Config) {
 	envInt(&c.Camera.IntervalSeconds, "IMAGE_INTERVAL_SECONDS")
 	envStr(&c.SensorType, "SENSOR_TYPE")
 	envFloat(&c.Water.LowCM, "WATER_LOW_CM")
+	envInt(&c.TelemetryIntervalSeconds, "TELEMETRY_INTERVAL_SECONDS")
 }
 
 func (c Config) Save(path string) error {

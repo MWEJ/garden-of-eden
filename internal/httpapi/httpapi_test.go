@@ -232,3 +232,63 @@ func TestCameraEndpoint(t *testing.T) {
 		t.Errorf("camera endpoint: code=%d ct=%s", rec.Code, rec.Header().Get("Content-Type"))
 	}
 }
+
+func TestBadBrightnessBodyHasErrorKey(t *testing.T) {
+	h, _, stop := newH(t)
+	defer stop()
+
+	// Bad value (out of range): previously returned {"message": "value must be 0..100"}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/light/brightness", strings.NewReader(`{"value":999}`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if _, ok := body["error"]; !ok {
+		t.Errorf("error body = %v, want key \"error\"", body)
+	}
+	if _, ok := body["message"]; ok {
+		t.Errorf("error body still has legacy key \"message\": %v", body)
+	}
+}
+
+func TestBadBrightnessInvalidJSONHasErrorKey(t *testing.T) {
+	h, _, stop := newH(t)
+	defer stop()
+
+	// Malformed JSON: previously returned {"message": "invalid JSON body"}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/pump/speed", strings.NewReader(`not-json`)))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if _, ok := body["error"]; !ok {
+		t.Errorf("error body = %v, want key \"error\"", body)
+	}
+}
+
+func TestLightOnSuccessBodyUnchanged(t *testing.T) {
+	h, _, stop := newH(t)
+	defer stop()
+
+	// Success response must still use "message", not "error"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/light/on", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if msg, ok := body["message"]; !ok || msg != "Light turned on" {
+		t.Errorf("success body = %v, want {\"message\":\"Light turned on\"}", body)
+	}
+}

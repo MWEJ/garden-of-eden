@@ -47,6 +47,15 @@ func (p *Publisher) publishOnce() {
 	if p.dev.Distance != nil {
 		if cm, err := p.dev.Distance.MeasureCM(); err == nil {
 			p.store.SetWaterLevel(cm)
+			// Recompute water.low on every cycle so the snapshot stays fresh
+			// even between pump-on attempts. Threshold == 0 means the interlock
+			// is disabled; skip in that case so we don't overwrite a deliberate
+			// SetWater call with a zero threshold.
+			snap := p.store.Snapshot()
+			if snap.Water.LowThresholdCM > 0 {
+				low := cm > snap.Water.LowThresholdCM
+				p.store.SetWater(snap.Water.LowThresholdCM, low)
+			}
 		}
 	}
 	if p.dev.Power != nil {

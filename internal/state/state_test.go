@@ -58,3 +58,18 @@ func TestConcurrentScheduleWriteAndMarshal(t *testing.T) {
 	}
 	<-done
 }
+
+func TestSetDeviceInfo(t *testing.T) {
+	s := New()
+	s.SetDeviceInfo("gardyn-42", "gardyn 3.0", "2.1.0")
+	snap := s.Snapshot()
+	if snap.Identifier != "gardyn-42" {
+		t.Errorf("Identifier = %q, want %q", snap.Identifier, "gardyn-42")
+	}
+	if snap.Model != "gardyn 3.0" {
+		t.Errorf("Model = %q, want %q", snap.Model, "gardyn 3.0")
+	}
+	if snap.Version != "2.1.0" {
+		t.Errorf("Version = %q, want %q", snap.Version, "2.1.0")
+	}
+}

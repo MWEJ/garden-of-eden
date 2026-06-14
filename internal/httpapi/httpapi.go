@@ -56,11 +56,11 @@ func levelHandler(c *core.Core, target core.Target) http.HandlerFunc {
 			Value int `json:"value"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"message": "invalid JSON body"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON body"})
 			return
 		}
 		if body.Value < 0 || body.Value > 100 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"message": "value must be 0..100"})
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "value must be 0..100"})
 			return
 		}
 		c.Submit(core.Command{Target: target, Action: core.ActionSetLevel, Value: body.Value})

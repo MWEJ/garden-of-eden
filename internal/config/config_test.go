@@ -119,3 +119,35 @@ func TestAtomicSaveRoundTrip(t *testing.T) {
 		t.Errorf("round-trip lost water/overtemp: water=%+v overtemp=%+v", got.Water, got.OverTemp)
 	}
 }
+
+func TestTelemetryIntervalDefault(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TelemetryIntervalSeconds != 30 {
+		t.Errorf("TelemetryIntervalSeconds default = %d, want 30", c.TelemetryIntervalSeconds)
+	}
+}
+
+func TestTelemetryIntervalEnvOverride(t *testing.T) {
+	t.Setenv("TELEMETRY_INTERVAL_SECONDS", "120")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TelemetryIntervalSeconds != 120 {
+		t.Errorf("TelemetryIntervalSeconds = %d, want 120", c.TelemetryIntervalSeconds)
+	}
+}
+
+func TestTelemetryIntervalClamped(t *testing.T) {
+	t.Setenv("TELEMETRY_INTERVAL_SECONDS", "0")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.TelemetryIntervalSeconds < 1 {
+		t.Errorf("TelemetryIntervalSeconds = %d after clamp, want >= 1", c.TelemetryIntervalSeconds)
+	}
+}

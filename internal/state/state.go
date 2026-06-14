@@ -37,14 +37,17 @@ type WaterState struct {
 }
 
 type Snapshot struct {
-	Available bool                 `json:"available"`
-	UptimeS   int64                `json:"uptime_s"`
-	Light     LightState           `json:"light"`
-	Pump      PumpState            `json:"pump"`
-	Sensors   Sensors              `json:"sensors"`
-	Water     WaterState           `json:"water"`
-	OverTemp  bool                 `json:"overtemp"`
-	Schedules map[string]SchedFlag `json:"schedules"`
+	Available  bool                 `json:"available"`
+	UptimeS    int64                `json:"uptime_s"`
+	Identifier string               `json:"identifier"`
+	Model      string               `json:"model"`
+	Version    string               `json:"version"`
+	Light      LightState           `json:"light"`
+	Pump       PumpState            `json:"pump"`
+	Sensors    Sensors              `json:"sensors"`
+	Water      WaterState           `json:"water"`
+	OverTemp   bool                 `json:"overtemp"`
+	Schedules  map[string]SchedFlag `json:"schedules"`
 }
 
 type SchedFlag struct {
@@ -102,6 +105,16 @@ func (s *Store) SetWater(thresholdCM float64, low bool) {
 }
 
 func (s *Store) SetOverTemp(v bool) { s.mu.Lock(); s.snap.OverTemp = v; s.mu.Unlock() }
+
+// SetDeviceInfo records the device's unique identifier, model string, and
+// firmware version in the snapshot. Call once at startup from main.
+func (s *Store) SetDeviceInfo(identifier, model, version string) {
+	s.mu.Lock()
+	s.snap.Identifier = identifier
+	s.snap.Model = model
+	s.snap.Version = version
+	s.mu.Unlock()
+}
 
 func (s *Store) SetScheduleEnabled(channel string, enabled bool) {
 	s.mu.Lock()
