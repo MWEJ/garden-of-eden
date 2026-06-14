@@ -1,0 +1,44 @@
+http:
+  port: 5000
+
+device:
+  identifier: gardyn-xx   # CHANGE THIS to your device's unique id
+  model: "gardyn 3.0"
+  version: "1.0.0"
+
+sensor_type: AM2320   # or DHT20
+
+water:
+  # Dry-pump safety interlock. low_cm is the max tank-probe distance (cm) that
+  # still counts as "has water"; above it the pump is blocked. It is
+  # device-specific — measure your tank and set it, then the interlock is active.
+  # 0 (default) disables the interlock.
+  low_cm: 0
+
+overtemp:
+  cut_light: false    # true => cut the light while the PCB is over-temp
+
+camera:
+  upper_device: /dev/video0
+  lower_device: /dev/video2
+  resolution: 640x480
+  interval_seconds: 3600
+
+schedules:
+  light:
+    enabled: true
+    entries:
+      - { at: "06:00", action: "on",  brightness: 70 }
+      - { at: "09:00", action: "off" }
+      - { at: "17:00", action: "on",  brightness: 50 }
+      - { at: "20:00", action: "off" }
+  # Illustrative pump schedule: three short cycles/day. Tune to your plant load.
+  pump:
+    enabled: true
+    entries:
+      - { at: "09:30", action: "on" }
+      - { at: "09:35", action: "off" }
+      - { at: "16:00", action: "on" }
+      - { at: "16:05", action: "off" }
+      - { at: "21:00", action: "on" }
+      - { at: "21:05", action: "off" }
