@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"bufio"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -505,8 +507,8 @@ func TestGetHealthzRich(t *testing.T) {
 		t.Fatalf("/healthz status = %d, want 200", rec.Code)
 	}
 	var body struct {
-		Status  string                        `json:"status"`
-		UptimeS int64                         `json:"uptime_s"`
+		Status  string                         `json:"status"`
+		UptimeS int64                          `json:"uptime_s"`
 		Sensors map[string]health.SensorStatus `json:"sensors"`
 	}
 	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
@@ -524,4 +526,78 @@ func TestGetHealthzRich(t *testing.T) {
 	if _, ok := body.Sensors["distance"]; !ok {
 		t.Error("/healthz sensors missing 'distance'")
 	}
+}
+
+// TestSSEStreamDeliversDataFrame verifies that GET /state/stream:
+//   - returns 200 with Content-Type: text/event-stream
+//   - immediately sends an initial data: frame (current snapshot)
+//   - sends another data: frame when the state changes
+//
+// Uses httptest.NewServer so the underlying TCP connection supports
+// http.Flusher (unlike httptest.ResponseRecorder).
+func TestSSEStreamDeliversDataFrame(t *testing.T) {
+	st := state.New()
+	c := core.New(mock.New(), st)
+	go c.Run()
+	defer c.Stop()
+
+	deps := ControlDeps{
+		GetSchedules:       func() config.Schedules { return config.Schedules{} },
+		PutSchedule:        func(string, config.Schedule) error { return nil },
+		SetScheduleEnabled: func(string, bool) error { return nil },
+		SetWaterLowCM:      func(float64) error { return nil },
+	}
+	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps, nil, nil)
+
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+
+	ctx, cancelCtx := context.WithCancel(context.Background())
+	defer cancelCtx()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL+"/state/stream", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("SSE status = %d, want 200", resp.StatusCode)
+	}
+	ct := resp.Header.Get("Content-Type")
+	if ct != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", ct)
+	}
+
+	// Read lines from the stream; signal when we find the first data: frame.
+	found := make(chan bool, 1)
+	go func() {
+		scanner := bufio.NewScanner(resp.Body)
+		for scanner.Scan() {
+			line := scanner.Text()
+			if strings.HasPrefix(line, "data:") {
+				found <- true
+				return
+			}
+		}
+		found <- false
+	}()
+
+	// Trigger a state change to guarantee a notification arrives.
+	time.Sleep(20 * time.Millisecond) // let handler send the initial frame first
+	st.SetLight(true, 99)
+
+	select {
+	case ok := <-found:
+		if !ok {
+			t.Fatal("SSE stream closed without any data: line")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("no data: frame received within 2s")
+	}
+	cancelCtx()
 }

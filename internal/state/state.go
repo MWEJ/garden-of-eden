@@ -59,6 +59,10 @@ type Store struct {
 	mu    sync.RWMutex
 	start time.Time
 	snap  Snapshot
+	// SSE push: each Subscribe() allocates a buffered chan and registers it here.
+	// notify() is called inside every mutating setter (while mu write-lock held).
+	nextSubID   uint64
+	subscribers map[uint64]chan struct{}
 }
 
 func New() *Store {
@@ -68,6 +72,42 @@ func New() *Store {
 			Available: true,
 			Schedules: map[string]SchedFlag{"light": {}, "pump": {}},
 		},
+		subscribers: make(map[uint64]chan struct{}),
+	}
+}
+
+// Subscribe returns a buffered (capacity 1) channel that receives an empty
+// struct whenever any setter mutates the snapshot. The caller must call cancel
+// when done to free resources. The channel is never closed by the store.
+//
+// Notification is coalescing: if the subscriber has not drained the channel
+// before the next mutation, the extra send is dropped (non-blocking). The
+// subscriber should always read the latest Snapshot() rather than counting
+// notifications.
+func (s *Store) Subscribe() (<-chan struct{}, func()) {
+	ch := make(chan struct{}, 1)
+	s.mu.Lock()
+	id := s.nextSubID
+	s.nextSubID++
+	s.subscribers[id] = ch
+	s.mu.Unlock()
+	cancel := func() {
+		s.mu.Lock()
+		delete(s.subscribers, id)
+		s.mu.Unlock()
+	}
+	return ch, cancel
+}
+
+// notify sends a non-blocking signal to all subscribers. Must be called with
+// s.mu write-lock held (all setters hold it, so this is always satisfied).
+func (s *Store) notify() {
+	for _, ch := range s.subscribers {
+		select {
+		case ch <- struct{}{}:
+		default:
+			// channel full — drop; subscriber will read the latest snapshot on next drain
+		}
 	}
 }
 
@@ -90,18 +130,21 @@ func (s *Store) Snapshot() Snapshot {
 func (s *Store) SetLight(on bool, brightness int) {
 	s.mu.Lock()
 	s.snap.Light = LightState{On: on, Brightness: brightness}
+	s.notify()
 	s.mu.Unlock()
 }
 
 func (s *Store) SetPump(on bool, speed int) {
 	s.mu.Lock()
 	s.snap.Pump = PumpState{On: on, Speed: speed}
+	s.notify()
 	s.mu.Unlock()
 }
 
 func (s *Store) SetWater(thresholdCM float64, low bool) {
 	s.mu.Lock()
 	s.snap.Water = WaterState{LowThresholdCM: thresholdCM, Low: low}
+	s.notify()
 	s.mu.Unlock()
 }
 
@@ -110,10 +153,16 @@ func (s *Store) SetWater(thresholdCM float64, low bool) {
 func (s *Store) SetWaterSensorOK(ok bool) {
 	s.mu.Lock()
 	s.snap.Water.SensorOK = ok
+	s.notify()
 	s.mu.Unlock()
 }
 
-func (s *Store) SetOverTemp(v bool) { s.mu.Lock(); s.snap.OverTemp = v; s.mu.Unlock() }
+func (s *Store) SetOverTemp(v bool) {
+	s.mu.Lock()
+	s.snap.OverTemp = v
+	s.notify()
+	s.mu.Unlock()
+}
 
 // SetDeviceInfo records the device's unique identifier, model string, and
 // firmware version in the snapshot. Call once at startup from main.
@@ -122,12 +171,14 @@ func (s *Store) SetDeviceInfo(identifier, model, version string) {
 	s.snap.Identifier = identifier
 	s.snap.Model = model
 	s.snap.Version = version
+	s.notify()
 	s.mu.Unlock()
 }
 
 func (s *Store) SetScheduleEnabled(channel string, enabled bool) {
 	s.mu.Lock()
 	s.snap.Schedules[channel] = SchedFlag{Enabled: enabled}
+	s.notify()
 	s.mu.Unlock()
 }
 
@@ -135,13 +186,34 @@ func (s *Store) SetScheduleEnabled(channel string, enabled bool) {
 func (s *Store) SetTemperature(c float64) {
 	s.mu.Lock()
 	s.snap.Sensors.TemperatureC = &c
+	s.notify()
 	s.mu.Unlock()
 }
-func (s *Store) SetHumidity(p float64) { s.mu.Lock(); s.snap.Sensors.HumidityPct = &p; s.mu.Unlock() }
-func (s *Store) SetPCBTemp(c float64)  { s.mu.Lock(); s.snap.Sensors.PCBTempC = &c; s.mu.Unlock() }
+
+func (s *Store) SetHumidity(p float64) {
+	s.mu.Lock()
+	s.snap.Sensors.HumidityPct = &p
+	s.notify()
+	s.mu.Unlock()
+}
+
+func (s *Store) SetPCBTemp(c float64) {
+	s.mu.Lock()
+	s.snap.Sensors.PCBTempC = &c
+	s.notify()
+	s.mu.Unlock()
+}
+
 func (s *Store) SetWaterLevel(cm float64) {
 	s.mu.Lock()
 	s.snap.Sensors.WaterLevelCM = &cm
+	s.notify()
 	s.mu.Unlock()
 }
-func (s *Store) SetPumpPower(p PumpPower) { s.mu.Lock(); s.snap.Sensors.Pump = &p; s.mu.Unlock() }
+
+func (s *Store) SetPumpPower(p PumpPower) {
+	s.mu.Lock()
+	s.snap.Sensors.Pump = &p
+	s.notify()
+	s.mu.Unlock()
+}

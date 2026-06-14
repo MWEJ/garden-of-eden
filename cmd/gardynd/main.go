@@ -144,6 +144,77 @@ func main() {
 		return persist()
 	}
 
+	// Hot-reload: poll mtime every ConfigReloadInterval, reapply live-mutable
+	// fields. Disabled when no config file is supplied (--config="").
+	// NOT hot-reloaded: HTTP port/bind, *IntervalSeconds — those require restart.
+	if *configPath != "" {
+		go func() {
+			ticker := time.NewTicker(config.ConfigReloadInterval)
+			defer ticker.Stop()
+			// lastMod is the mtime at startup.
+			info, err := os.Stat(*configPath)
+			if err != nil {
+				slog.Error("config reload: initial stat failed", "err", err)
+				return
+			}
+			lastMod := info.ModTime()
+			for range ticker.C {
+				info, err := os.Stat(*configPath)
+				if err != nil {
+					slog.Error("config reload: stat", "err", err)
+					continue
+				}
+				if !info.ModTime().After(lastMod) {
+					continue
+				}
+				newFileCfg, err := config.LoadFileOnly(*configPath)
+				if err != nil {
+					slog.Error("config reload: parse error, keeping old config", "err", err)
+					continue
+				}
+				// Snapshot the baseline under schedMu — persist()/setWaterCM also
+				// read & mutate fileCfg under schedMu, so an unguarded read here
+				// would be a data race. ApplyReload runs WITHOUT the lock so its
+				// callbacks (which take schedMu) don't deadlock.
+				schedMu.Lock()
+				oldCfg := fileCfg
+				schedMu.Unlock()
+				config.ApplyReload(oldCfg, newFileCfg, config.ReloadOpts{
+					SetLightSchedule: func(s config.Schedule) {
+						schedMu.Lock()
+						schedules.Light = s
+						schedMu.Unlock()
+					},
+					SetPumpSchedule: func(s config.Schedule) {
+						schedMu.Lock()
+						schedules.Pump = s
+						schedMu.Unlock()
+					},
+					SetLightEnabled: func(on bool) {
+						st.SetScheduleEnabled("light", on)
+					},
+					SetPumpEnabled: func(on bool) {
+						st.SetScheduleEnabled("pump", on)
+					},
+					SetWaterLowCM: func(cm float64) {
+						c.SetWaterLowCM(cm)
+						schedMu.Lock()
+						fileCfg.Water.LowCM = cm
+						schedMu.Unlock()
+					},
+					SetCutLightOnOverTemp: func(b bool) {
+						c.SetCutLightOnOverTemp(b)
+					},
+				})
+				schedMu.Lock()
+				fileCfg = newFileCfg
+				schedMu.Unlock()
+				lastMod = info.ModTime()
+				slog.Info("config reloaded", "path", *configPath)
+			}
+		}()
+	}
+
 	if cfg.HasSolarEntry() && cfg.Location.Latitude == 0 && cfg.Location.Longitude == 0 {
 		slog.Warn("solar schedule entries present but location lat/lon unset; " +
 			"solar times will be computed at (0,0). Set LAT/LON or config location.")

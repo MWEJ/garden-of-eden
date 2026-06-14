@@ -266,7 +266,62 @@ func HandlerFull(c *core.Core, st *state.Store, d hw.Devices, frames *state.Fram
 		writeMetrics(w, st, rec)
 	})
 
+	// GET /state/stream — Server-Sent Events push of state snapshots.
+	// Requires state.Store.Subscribe (added in Plan 10 Task 3).
+	// Auth applies like /state (no exemption added here).
+	mux.HandleFunc("GET /state/stream", streamHandler(st))
+
 	return mux
+}
+
+// streamHandler returns an SSE handler that pushes the current state snapshot
+// immediately on connect, then on every state mutation (via st.Subscribe), plus
+// a 30-second heartbeat comment so proxies and NAT keep the connection open.
+//
+// Registration: HandlerFull registers this on "GET /state/stream". baseMux and
+// sensorMux do not include it — they do not have access to Subscribe.
+func streamHandler(st *state.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming not supported", http.StatusNotImplemented)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no") // disable nginx buffering
+		w.WriteHeader(http.StatusOK)
+
+		ch, cancel := st.Subscribe()
+		defer cancel()
+
+		// Send initial snapshot immediately so the client is never in an unknown state.
+		sendSnapshot := func() {
+			b, err := json.Marshal(st.Snapshot())
+			if err != nil {
+				return
+			}
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			flusher.Flush()
+		}
+		sendSnapshot()
+
+		heartbeat := time.NewTicker(30 * time.Second)
+		defer heartbeat.Stop()
+
+		for {
+			select {
+			case <-r.Context().Done():
+				return
+			case <-ch:
+				sendSnapshot()
+			case <-heartbeat.C:
+				// SSE comment line — keeps the connection alive through proxies/NAT.
+				fmt.Fprintf(w, ": heartbeat\n\n")
+				flusher.Flush()
+			}
+		}
+	}
 }
 
 // WithAuth wraps h with bearer-token authentication. When token is empty,
