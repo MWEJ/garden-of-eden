@@ -99,10 +99,13 @@ jobs:
 
   ruff:
     runs-on: ubuntu-latest
-    if: hashFiles('custom_components/**/*.py') != ''
     steps:
       - uses: actions/checkout@v4
-      - name: Install ruff
-        run: pip install ruff
-      - name: Lint Python HA integration
-        run: ruff check custom_components/
+      - name: Lint Python HA integration (if present)
+        run: |
+          if [ -d custom_components ]; then
+            pip install ruff
+            ruff check custom_components/
+          else
+            echo "no custom_components/ on this branch; skipping ruff"
+          fi
