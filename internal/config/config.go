@@ -13,7 +13,9 @@ import (
 )
 
 type HTTPConfig struct {
-	Port int `yaml:"port"`
+	Port        int    `yaml:"port"`
+	BindAddress string `yaml:"bind_address"`
+	AuthToken   string `yaml:"auth_token"`
 }
 
 type DeviceConfig struct {
@@ -121,6 +123,8 @@ func Load(path string) (Config, error) {
 
 func applyEnv(c *Config) {
 	envInt(&c.HTTP.Port, "HTTP_PORT")
+	envStr(&c.HTTP.BindAddress, "HTTP_BIND_ADDRESS")
+	envStr(&c.HTTP.AuthToken, "HTTP_AUTH_TOKEN")
 	envStr(&c.Device.Identifier, "MQTT_IDENTIFIER") // legacy key name retained
 	envStr(&c.Device.Model, "MQTT_DEVICE_MODEL")
 	envStr(&c.Device.Version, "MQTT_VERSION")

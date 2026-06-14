@@ -3,12 +3,13 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -197,8 +198,13 @@ func main() {
 		SetWaterLowCM:      setWaterCM,
 	}
 
-	addr := fmt.Sprintf(":%d", cfg.HTTP.Port)
-	server := &http.Server{Addr: addr, Handler: httpapi.HandlerFull(c, st, devs, frames, deps, rec, tr)}
+	const maxRequestBytes = 1 << 20 // 1 MiB body cap
+
+	addr := net.JoinHostPort(cfg.HTTP.BindAddress, strconv.Itoa(cfg.HTTP.Port))
+	handler := httpapi.HandlerFull(c, st, devs, frames, deps, rec, tr)
+	handler = httpapi.WithAuth(handler, cfg.HTTP.AuthToken)
+	handler = http.MaxBytesHandler(handler, maxRequestBytes)
+	server := &http.Server{Addr: addr, Handler: handler}
 	go func() {
 		slog.Info("REST listening", "addr", addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {

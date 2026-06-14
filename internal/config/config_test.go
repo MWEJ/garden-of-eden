@@ -248,3 +248,45 @@ func TestParseLogLevel(t *testing.T) {
 		}
 	}
 }
+
+func TestHTTPAuthTokenDefault(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HTTP.AuthToken != "" {
+		t.Errorf("HTTP.AuthToken default = %q, want empty string (auth disabled)", c.HTTP.AuthToken)
+	}
+}
+
+func TestHTTPAuthTokenEnvOverride(t *testing.T) {
+	t.Setenv("HTTP_AUTH_TOKEN", "supersecret")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HTTP.AuthToken != "supersecret" {
+		t.Errorf("HTTP.AuthToken = %q, want %q", c.HTTP.AuthToken, "supersecret")
+	}
+}
+
+func TestHTTPBindAddressDefault(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HTTP.BindAddress != "" {
+		t.Errorf("HTTP.BindAddress default = %q, want empty string (all interfaces)", c.HTTP.BindAddress)
+	}
+}
+
+func TestHTTPBindAddressEnvOverride(t *testing.T) {
+	t.Setenv("HTTP_BIND_ADDRESS", "127.0.0.1")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.HTTP.BindAddress != "127.0.0.1" {
+		t.Errorf("HTTP.BindAddress = %q, want %q", c.HTTP.BindAddress, "127.0.0.1")
+	}
+}

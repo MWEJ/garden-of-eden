@@ -374,6 +374,124 @@ func TestGetMetrics(t *testing.T) {
 	}
 }
 
+// newHFull builds a HandlerFull backed by a mock core, suitable for auth tests.
+func newHFull(t *testing.T) (http.Handler, func()) {
+	t.Helper()
+	st := state.New()
+	c := core.New(mock.New(), st)
+	go c.Run()
+	deps := ControlDeps{
+		GetSchedules:       func() config.Schedules { return config.Schedules{} },
+		PutSchedule:        func(string, config.Schedule) error { return nil },
+		SetScheduleEnabled: func(string, bool) error { return nil },
+		SetWaterLowCM:      func(float64) error { return nil },
+	}
+	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps, nil, nil)
+	return h, c.Stop
+}
+
+func TestWithAuthDisabledPassesThrough(t *testing.T) {
+	inner, stop := newHFull(t)
+	defer stop()
+	h := WithAuth(inner, "") // empty token = auth disabled
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("auth disabled: /healthz status = %d, want 200", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/state", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("auth disabled: /state status = %d, want 200 (no token configured)", rec.Code)
+	}
+}
+
+func TestWithAuthCorrectTokenAllows(t *testing.T) {
+	inner, stop := newHFull(t)
+	defer stop()
+	h := WithAuth(inner, "mytoken")
+
+	req := httptest.NewRequest(http.MethodGet, "/state", nil)
+	req.Header.Set("Authorization", "Bearer mytoken")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Errorf("correct token: /state status = %d, want 200", rec.Code)
+	}
+}
+
+func TestWithAuthMissingOrWrongTokenRejects(t *testing.T) {
+	inner, stop := newHFull(t)
+	defer stop()
+	h := WithAuth(inner, "mytoken")
+
+	// missing header
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/state", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("missing header: status = %d, want 401", rec.Code)
+	}
+	var body map[string]string
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode body: %v", err)
+	}
+	if body["error"] != "unauthorized" {
+		t.Errorf("error body = %v, want {\"error\":\"unauthorized\"}", body)
+	}
+
+	// wrong token
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/state", nil)
+	req.Header.Set("Authorization", "Bearer wrongtoken")
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("wrong token: status = %d, want 401", rec.Code)
+	}
+}
+
+func TestWithAuthHealthzExempt(t *testing.T) {
+	inner, stop := newHFull(t)
+	defer stop()
+	h := WithAuth(inner, "mytoken")
+
+	// /healthz must be reachable without any Authorization header
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("/healthz with token configured but no header: status = %d, want 200", rec.Code)
+	}
+}
+
+func TestMaxBodySizeRejectsOversizedRequest(t *testing.T) {
+	inner, stop := newHFull(t)
+	defer stop()
+
+	const maxBytes = 1 << 20 // 1 MiB — must match the constant in main.go
+	h := http.MaxBytesHandler(inner, maxBytes)
+
+	// Build a single JSON object whose body exceeds 1 MiB.  The decoder must
+	// read the entire object (including the large "noise" string field) before
+	// it can return, so http.MaxBytesReader fires mid-read and Decode returns
+	// *http.MaxBytesError, which levelHandler maps to 400.
+	// A repeated stream of {"value":1} does NOT trigger the limit because
+	// json.Decoder only reads the first 11-byte object and returns immediately.
+	noise := strings.Repeat("A", (2<<20))
+	oversized := `{"value":1,"noise":"` + noise + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/light/brightness", strings.NewReader(oversized))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// The oversized body must be rejected — 400 (decode error) or 413 (MaxBytesHandler).
+	if rec.Code >= 500 {
+		t.Errorf("oversized body: status = %d, want 4xx (body must be rejected, not cause 5xx)", rec.Code)
+	}
+	if rec.Code == http.StatusOK {
+		t.Errorf("oversized body: status = 200, want 4xx (body must be rejected)")
+	}
+}
+
 func TestGetHealthzRich(t *testing.T) {
 	h, _, tr, stop := newFullH(t)
 	defer stop()

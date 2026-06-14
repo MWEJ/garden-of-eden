@@ -3,6 +3,7 @@
 package httpapi
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -266,6 +267,33 @@ func HandlerFull(c *core.Core, st *state.Store, d hw.Devices, frames *state.Fram
 	})
 
 	return mux
+}
+
+// WithAuth wraps h with bearer-token authentication. When token is empty,
+// auth is disabled and h is returned unchanged (backward-compatible).
+// /healthz is always exempt so health checks work without credentials.
+// Compare with crypto/subtle to avoid timing attacks.
+//
+// Future note: when /metrics is added (a later plan), add it to the exempt
+// list here alongside /healthz.
+func WithAuth(h http.Handler, token string) http.Handler {
+	if token == "" {
+		return h // auth disabled — pass-through
+	}
+	want := []byte("Bearer " + token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// /healthz is unconditionally exempt.
+		if r.URL.Path == "/healthz" {
+			h.ServeHTTP(w, r)
+			return
+		}
+		got := []byte(strings.TrimSpace(r.Header.Get("Authorization")))
+		if subtle.ConstantTimeCompare(got, want) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // writeMetrics writes the Prometheus text exposition format to w.
