@@ -1,7 +1,7 @@
 package real
 
 import (
-	"log"
+	"log/slog"
 	"time"
 
 	"github.com/iot-root/garden-of-eden/internal/config"
@@ -36,7 +36,7 @@ func New(cfg config.Config) (hw.Devices, func(), error) {
 
 	bus, err := OpenBus()
 	if err != nil {
-		log.Printf("i2c bus unavailable: %v (sensors disabled)", err)
+		slog.Warn("i2c bus unavailable, sensors disabled", "err", err)
 	} else {
 		closers = append(closers, func() { _ = bus.Close() })
 		switch cfg.SensorType {
@@ -46,7 +46,7 @@ func New(cfg config.Config) (hw.Devices, func(), error) {
 			d.Env = NewEnvAM2320(bus)
 		}
 		if pcb, err := NewPCT2075(bus, gpioChip, 25); err != nil {
-			log.Printf("pct2075 init failed: %v", err)
+			slog.Warn("pct2075 init failed", "err", err)
 		} else {
 			d.PCBTemp = pcb
 			closers = append(closers, func() { _ = pcb.Close() })
@@ -55,18 +55,18 @@ func New(cfg config.Config) (hw.Devices, func(), error) {
 	}
 
 	if cam, err := NewV4L2Camera(cfg.Camera.UpperDevice, cfg.Camera.Resolution); err != nil {
-		log.Printf("upper camera (%s @ %s) init failed: %v", cfg.Camera.UpperDevice, cfg.Camera.Resolution, err)
+		slog.Warn("upper camera init failed", "device", cfg.Camera.UpperDevice, "resolution", cfg.Camera.Resolution, "err", err)
 	} else {
 		d.UpperCamera = cam
 	}
 	if cam, err := NewV4L2Camera(cfg.Camera.LowerDevice, cfg.Camera.Resolution); err != nil {
-		log.Printf("lower camera (%s @ %s) init failed: %v", cfg.Camera.LowerDevice, cfg.Camera.Resolution, err)
+		slog.Warn("lower camera init failed", "device", cfg.Camera.LowerDevice, "resolution", cfg.Camera.Resolution, "err", err)
 	} else {
 		d.LowerCamera = cam
 	}
 
 	if btn, err := NewGPIOButton(gpioChip, 13, 500*time.Millisecond, 200*time.Millisecond); err != nil {
-		log.Printf("button init failed: %v", err)
+		slog.Warn("button init failed", "err", err)
 	} else {
 		d.Button = btn
 		closers = append(closers, func() { _ = btn.Close() })
