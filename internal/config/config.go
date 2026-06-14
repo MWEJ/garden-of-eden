@@ -4,6 +4,7 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -60,6 +61,7 @@ type Config struct {
 	Pump                     PumpConfig     `yaml:"pump"`
 	OverTemp                 OverTempConfig `yaml:"overtemp"`
 	TelemetryIntervalSeconds int            `yaml:"telemetry_interval_seconds"`
+	LogLevel                 string         `yaml:"log_level"`
 }
 
 func defaults() Config {
@@ -76,6 +78,7 @@ func defaults() Config {
 		Water:                    WaterConfig{BlockOnSensorError: true},
 		Pump:                     PumpConfig{MaxRuntimeSeconds: 600, StateFile: "/run/gardynd/pump.json"},
 		TelemetryIntervalSeconds: 30,
+		LogLevel:                 "info",
 	}
 }
 
@@ -131,6 +134,7 @@ func applyEnv(c *Config) {
 	envInt(&c.Pump.MaxRuntimeSeconds, "PUMP_MAX_RUNTIME_SECONDS")
 	envStr(&c.Pump.StateFile, "PUMP_STATE_FILE")
 	envInt(&c.TelemetryIntervalSeconds, "TELEMETRY_INTERVAL_SECONDS")
+	envStr(&c.LogLevel, "LOG_LEVEL")
 }
 
 func (c Config) Save(path string) error {
@@ -190,5 +194,23 @@ func envBool(dst *bool, key string) {
 		if b, err := strconv.ParseBool(v); err == nil {
 			*dst = b
 		}
+	}
+}
+
+// ParseLogLevel converts a string level name ("debug", "info", "warn", "error",
+// case-insensitive) to a slog.Level. Unknown or empty strings default to
+// slog.LevelInfo.
+func ParseLogLevel(s string) slog.Level {
+	switch s {
+	case "debug", "DEBUG":
+		return slog.LevelDebug
+	case "info", "INFO":
+		return slog.LevelInfo
+	case "warn", "WARN", "warning", "WARNING":
+		return slog.LevelWarn
+	case "error", "ERROR":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
 	}
 }

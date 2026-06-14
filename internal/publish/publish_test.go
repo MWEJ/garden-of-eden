@@ -2,7 +2,9 @@ package publish
 
 import (
 	"testing"
+	"time"
 
+	"github.com/iot-root/garden-of-eden/internal/health"
 	"github.com/iot-root/garden-of-eden/internal/hw/mock"
 	"github.com/iot-root/garden-of-eden/internal/state"
 )
@@ -104,5 +106,23 @@ func TestPublishOnceSkipsWaterLowWhenThresholdZero(t *testing.T) {
 	snap := st.Snapshot()
 	if snap.Water.Low {
 		t.Errorf("water.low = true, want false (threshold disabled)")
+	}
+}
+
+func TestPublishOnceTouchesHealthTracker(t *testing.T) {
+	devs := mock.New()
+	st := state.New()
+	p := New(devs, st, state.NewFrames(), 0, nil)
+
+	tr := health.NewTracker()
+	p.SetHealthTracker(tr)
+	p.publishOnce()
+
+	now := time.Now()
+	for _, name := range []string{"env", "pcb_temp", "distance", "pump_power"} {
+		_, ok := tr.SensorAge(name, now)
+		if !ok {
+			t.Errorf("health tracker: sensor %q not touched after publishOnce", name)
+		}
 	}
 }

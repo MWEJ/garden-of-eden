@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/iot-root/garden-of-eden/internal/events"
 	"github.com/iot-root/garden-of-eden/internal/hw/mock"
 	"github.com/iot-root/garden-of-eden/internal/state"
 )
@@ -330,5 +331,80 @@ func TestEnforcePumpRuntimeNoFileReturnsZero(t *testing.T) {
 	c := New(mock.New(), state.New())
 	if got := c.EnforcePumpRuntime(path, 10*time.Minute, time.Now()); got != 0 {
 		t.Errorf("remaining = %v, want 0 when no file", got)
+	}
+}
+
+func TestInterlockBlockRecordsEvent(t *testing.T) {
+	st := state.New()
+	devs := mock.New()
+	devs.Distance.(*mock.Distance).CM = 12.0 // > threshold => water low => interlock fires
+	c := New(devs, st)
+	c.SetWaterLowCM(10.0)
+
+	rec := events.NewRecorder(20)
+	c.SetEvents(rec)
+
+	go c.Run()
+	defer c.Stop()
+
+	c.Submit(Command{Target: TargetPump, Action: ActionOn})
+
+	// Wait for water.low to be set (interlock has fired).
+	for i := 0; i < 50; i++ {
+		if st.Snapshot().Water.Low {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !st.Snapshot().Water.Low {
+		t.Fatal("interlock did not fire (water.low not set)")
+	}
+
+	snap := rec.Snapshot()
+	found := false
+	for _, ev := range snap {
+		if ev.Kind == "interlock_block" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("interlock_block event not recorded; events = %+v", snap)
+	}
+}
+
+func TestPumpOnOffRecordsEvents(t *testing.T) {
+	st := state.New()
+	c := New(mock.New(), st)
+	rec := events.NewRecorder(20)
+	c.SetEvents(rec)
+	go c.Run()
+	defer c.Stop()
+
+	c.Submit(Command{Target: TargetPump, Action: ActionOn})
+	for i := 0; i < 50; i++ {
+		if st.Snapshot().Pump.On {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	c.Submit(Command{Target: TargetPump, Action: ActionOff})
+	for i := 0; i < 50; i++ {
+		if !st.Snapshot().Pump.On {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	snap := rec.Snapshot()
+	kinds := make(map[string]bool)
+	for _, ev := range snap {
+		kinds[ev.Kind] = true
+	}
+	if !kinds["pump_on"] {
+		t.Errorf("pump_on event not recorded; events = %+v", snap)
+	}
+	if !kinds["pump_off"] {
+		t.Errorf("pump_off event not recorded; events = %+v", snap)
 	}
 }

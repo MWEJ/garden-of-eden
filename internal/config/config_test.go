@@ -207,3 +207,44 @@ func TestBlockOnSensorErrorEnvOverride(t *testing.T) {
 		t.Errorf("Water.BlockOnSensorError = true after env=false, want false")
 	}
 }
+
+func TestLogLevelDefault(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.LogLevel != "info" {
+		t.Errorf("LogLevel default = %q, want %q", c.LogLevel, "info")
+	}
+}
+
+func TestLogLevelEnvOverride(t *testing.T) {
+	t.Setenv("LOG_LEVEL", "debug")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.LogLevel != "debug" {
+		t.Errorf("LogLevel = %q, want %q", c.LogLevel, "debug")
+	}
+}
+
+func TestParseLogLevel(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string // slog level name from level.String()
+	}{
+		{"debug", "DEBUG"},
+		{"info", "INFO"},
+		{"warn", "WARN"},
+		{"error", "ERROR"},
+		{"", "INFO"},     // empty → default
+		{"bogus", "INFO"}, // unknown → default
+	}
+	for _, tc := range cases {
+		lv := ParseLogLevel(tc.in)
+		if lv.String() != tc.want {
+			t.Errorf("ParseLogLevel(%q).String() = %q, want %q", tc.in, lv.String(), tc.want)
+		}
+	}
+}

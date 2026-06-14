@@ -10,6 +10,8 @@ import (
 
 	"github.com/iot-root/garden-of-eden/internal/config"
 	"github.com/iot-root/garden-of-eden/internal/core"
+	"github.com/iot-root/garden-of-eden/internal/events"
+	"github.com/iot-root/garden-of-eden/internal/health"
 	"github.com/iot-root/garden-of-eden/internal/hw"
 	"github.com/iot-root/garden-of-eden/internal/hw/mock"
 	"github.com/iot-root/garden-of-eden/internal/state"
@@ -124,7 +126,7 @@ func TestSchedulePutGetAndEnable(t *testing.T) {
 		},
 		SetWaterLowCM: func(cm float64) error { return nil },
 	}
-	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps)
+	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps, nil, nil)
 
 	body := `{"enabled":true,"entries":[{"at":"06:00","action":"on","brightness":70}]}`
 	rec := httptest.NewRecorder()
@@ -163,7 +165,7 @@ func TestScheduleUnknownChannel404(t *testing.T) {
 		SetScheduleEnabled: func(string, bool) error { return nil },
 		SetWaterLowCM:      func(float64) error { return nil },
 	}
-	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps)
+	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps, nil, nil)
 	body := `{"enabled":true,"entries":[{"at":"06:00","action":"on"}]}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/schedules/bogus", strings.NewReader(body)))
@@ -183,7 +185,7 @@ func TestScheduleInvalidAction400(t *testing.T) {
 		SetScheduleEnabled: func(string, bool) error { return nil },
 		SetWaterLowCM:      func(float64) error { return nil },
 	}
-	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps)
+	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps, nil, nil)
 	body := `{"enabled":true,"entries":[{"at":"06:00","action":"blink"}]}`
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/schedules/light", strings.NewReader(body)))
@@ -204,7 +206,7 @@ func TestWaterThresholdEndpoint(t *testing.T) {
 		SetScheduleEnabled: func(string, bool) error { return nil },
 		SetWaterLowCM:      func(cm float64) error { gotCM = cm; return nil },
 	}
-	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps)
+	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps, nil, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/water/low-threshold", strings.NewReader(`{"cm":8.5}`)))
 	if rec.Code != http.StatusOK || gotCM != 8.5 {
@@ -225,7 +227,7 @@ func TestCameraEndpoint(t *testing.T) {
 		SetScheduleEnabled: func(string, bool) error { return nil },
 		SetWaterLowCM:      func(float64) error { return nil },
 	}
-	h := HandlerFull(c, st, mock.New(), frames, deps)
+	h := HandlerFull(c, st, mock.New(), frames, deps, nil, nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/camera/upper.jpg", nil))
 	if rec.Code != http.StatusOK || rec.Header().Get("Content-Type") != "image/jpeg" {
@@ -290,5 +292,118 @@ func TestLightOnSuccessBodyUnchanged(t *testing.T) {
 	}
 	if msg, ok := body["message"]; !ok || msg != "Light turned on" {
 		t.Errorf("success body = %v, want {\"message\":\"Light turned on\"}", body)
+	}
+}
+
+func newFullH(t *testing.T) (http.Handler, *events.Recorder, *health.Tracker, func()) {
+	t.Helper()
+	st := state.New()
+	// Pre-populate sensor readings so /metrics can emit gardynd_temperature_c etc.
+	temp := 22.5
+	st.SetTemperature(temp)
+	c := core.New(mock.New(), st)
+	go c.Run()
+	rec := events.NewRecorder(100)
+	tr := health.NewTracker()
+	deps := ControlDeps{
+		GetSchedules:       func() config.Schedules { return config.Schedules{} },
+		PutSchedule:        func(string, config.Schedule) error { return nil },
+		SetScheduleEnabled: func(string, bool) error { return nil },
+		SetWaterLowCM:      func(float64) error { return nil },
+	}
+	h := HandlerFull(c, st, mock.New(), state.NewFrames(), deps, rec, tr)
+	return h, rec, tr, c.Stop
+}
+
+func TestGetEvents(t *testing.T) {
+	h, rec, _, stop := newFullH(t)
+	defer stop()
+
+	rec.Record("pump_on", "speed=100")
+	rec.Record("pump_off", "")
+
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/events", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("/events status = %d, want 200", rec2.Code)
+	}
+	ct := rec2.Header().Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var evs []map[string]any
+	if err := json.NewDecoder(rec2.Body).Decode(&evs); err != nil {
+		t.Fatalf("decode /events body: %v", err)
+	}
+	if len(evs) != 2 {
+		t.Errorf("len(events) = %d, want 2", len(evs))
+	}
+	if evs[0]["kind"] != "pump_on" {
+		t.Errorf("events[0].kind = %v, want pump_on", evs[0]["kind"])
+	}
+}
+
+func TestGetMetrics(t *testing.T) {
+	h, rec, _, stop := newFullH(t)
+	defer stop()
+
+	rec.Record("pump_on", "speed=100")
+	rec.Record("interlock_block", "distance=15.0cm threshold=10.0cm")
+	rec.Record("pump_failsafe", "after=10m0s")
+	rec.Record("overtemp", "")
+
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("/metrics status = %d, want 200", rec2.Code)
+	}
+	ct := rec2.Header().Get("Content-Type")
+	if ct != "text/plain; version=0.0.4" {
+		t.Errorf("Content-Type = %q, want text/plain; version=0.0.4", ct)
+	}
+	body := rec2.Body.String()
+	for _, substr := range []string{
+		"gardynd_temperature_c",
+		"gardynd_pump_runs_total",
+		"# HELP",
+		"# TYPE",
+	} {
+		if !strings.Contains(body, substr) {
+			t.Errorf("/metrics body missing %q\nbody:\n%s", substr, body)
+		}
+	}
+}
+
+func TestGetHealthzRich(t *testing.T) {
+	h, _, tr, stop := newFullH(t)
+	defer stop()
+
+	tr.Touch("env")
+	tr.Touch("distance")
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("/healthz status = %d, want 200", rec.Code)
+	}
+	var body struct {
+		Status  string                        `json:"status"`
+		UptimeS int64                         `json:"uptime_s"`
+		Sensors map[string]health.SensorStatus `json:"sensors"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode /healthz body: %v", err)
+	}
+	if body.Status != "ok" {
+		t.Errorf("status = %q, want ok", body.Status)
+	}
+	if _, ok := body.Sensors["env"]; !ok {
+		t.Error("/healthz sensors missing 'env'")
+	}
+	if !body.Sensors["env"].OK {
+		t.Error("/healthz sensors env.ok = false, want true (just touched)")
+	}
+	if _, ok := body.Sensors["distance"]; !ok {
+		t.Error("/healthz sensors missing 'distance'")
 	}
 }

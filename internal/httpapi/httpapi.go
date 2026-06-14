@@ -6,16 +6,26 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/iot-root/garden-of-eden/internal/config"
 	"github.com/iot-root/garden-of-eden/internal/core"
+	"github.com/iot-root/garden-of-eden/internal/events"
+	"github.com/iot-root/garden-of-eden/internal/health"
 	"github.com/iot-root/garden-of-eden/internal/hw"
 	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
 // Handler builds the REST mux. Plan 3 extends it (schedules, sensors, cameras)
 // via baseMux.
-func Handler(c *core.Core, st *state.Store) http.Handler { return baseMux(c, st) }
+func Handler(c *core.Core, st *state.Store) http.Handler {
+	mux := baseMux(c, st)
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	return mux
+}
 
 func baseMux(c *core.Core, st *state.Store) *http.ServeMux {
 	mux := http.NewServeMux()
@@ -23,9 +33,8 @@ func baseMux(c *core.Core, st *state.Store) *http.ServeMux {
 	mux.HandleFunc("GET /state", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, st.Snapshot())
 	})
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-	})
+	// Note: GET /healthz is NOT registered here. It is added by Handler (simple)
+	// or HandlerFull (rich), to avoid duplicate registration panics.
 
 	mux.HandleFunc("POST /light/on", func(w http.ResponseWriter, _ *http.Request) {
 		c.Submit(core.Command{Target: core.TargetLight, Action: core.ActionOn})
@@ -143,9 +152,25 @@ type ControlDeps struct {
 }
 
 // HandlerFull is the complete API: base control + sensor reads + schedules +
-// water threshold + cameras.
-func HandlerFull(c *core.Core, st *state.Store, d hw.Devices, frames *state.Frames, deps ControlDeps) http.Handler {
+// water threshold + cameras + events + metrics + rich healthz.
+func HandlerFull(c *core.Core, st *state.Store, d hw.Devices, frames *state.Frames, deps ControlDeps, rec *events.Recorder, tr *health.Tracker) http.Handler {
 	mux := sensorMux(c, st, d) // base + sensor GET routes (*http.ServeMux)
+
+	// GET /healthz — richer health check with per-sensor status.
+	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
+		snap := st.Snapshot()
+		var sensors map[string]health.SensorStatus
+		if tr != nil {
+			sensors = tr.Snapshot(time.Now())
+		} else {
+			sensors = map[string]health.SensorStatus{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":   "ok",
+			"uptime_s": snap.UptimeS,
+			"sensors":  sensors,
+		})
+	})
 
 	mux.HandleFunc("GET /schedules", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, deps.GetSchedules())
@@ -221,5 +246,92 @@ func HandlerFull(c *core.Core, st *state.Store, d hw.Devices, frames *state.Fram
 	mux.HandleFunc("GET /camera/upper.jpg", serveFrame(frames.Upper))
 	mux.HandleFunc("GET /camera/lower.jpg", serveFrame(frames.Lower))
 
+	// GET /events — event ring buffer snapshot
+	mux.HandleFunc("GET /events", func(w http.ResponseWriter, _ *http.Request) {
+		var snap []events.Event
+		if rec != nil {
+			snap = rec.Snapshot()
+		}
+		if snap == nil {
+			snap = []events.Event{} // encode as [] not null
+		}
+		writeJSON(w, http.StatusOK, snap)
+	})
+
+	// GET /metrics — hand-rolled Prometheus text exposition
+	mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+		w.WriteHeader(http.StatusOK)
+		writeMetrics(w, st, rec)
+	})
+
 	return mux
+}
+
+// writeMetrics writes the Prometheus text exposition format to w.
+// Nil sensor pointer fields in the snapshot are silently skipped.
+func writeMetrics(w http.ResponseWriter, st *state.Store, rec *events.Recorder) {
+	snap := st.Snapshot()
+	b := &strings.Builder{}
+
+	gauge := func(name, help string, val float64) {
+		fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s gauge\n%s %.6g\n", name, help, name, name, val)
+	}
+	boolGauge := func(name, help string, v bool) {
+		f := 0.0
+		if v {
+			f = 1.0
+		}
+		gauge(name, help, f)
+	}
+	counter := func(name, help string, val int64) {
+		fmt.Fprintf(b, "# HELP %s %s\n# TYPE %s counter\n%s_total %d\n", name, help, name, name, val)
+	}
+
+	// Gauges from state snapshot.
+	if snap.Sensors.TemperatureC != nil {
+		gauge("gardynd_temperature_c", "Ambient temperature in Celsius.", *snap.Sensors.TemperatureC)
+	}
+	if snap.Sensors.HumidityPct != nil {
+		gauge("gardynd_humidity_pct", "Ambient relative humidity percent.", *snap.Sensors.HumidityPct)
+	}
+	if snap.Sensors.PCBTempC != nil {
+		gauge("gardynd_pcb_temp_c", "PCB temperature in Celsius.", *snap.Sensors.PCBTempC)
+	}
+	if snap.Sensors.WaterLevelCM != nil {
+		gauge("gardynd_water_level_cm", "Distance sensor reading in cm (higher = lower water).", *snap.Sensors.WaterLevelCM)
+	}
+	if snap.Sensors.Pump != nil {
+		gauge("gardynd_pump_bus_voltage", "Pump INA219 bus voltage in volts.", snap.Sensors.Pump.BusVoltage)
+		gauge("gardynd_pump_current", "Pump INA219 current in amps.", snap.Sensors.Pump.Current)
+		gauge("gardynd_pump_power", "Pump INA219 power in watts.", snap.Sensors.Pump.Power)
+	}
+	gauge("gardynd_uptime_seconds", "Seconds since gardynd started.", float64(snap.UptimeS))
+	boolGauge("gardynd_pump_on", "1 if the pump is currently on.", snap.Pump.On)
+	boolGauge("gardynd_light_on", "1 if the light is currently on.", snap.Light.On)
+	boolGauge("gardynd_water_low", "1 if the water level is below the low threshold.", snap.Water.Low)
+	boolGauge("gardynd_overtemp", "1 if an over-temperature condition is active.", snap.OverTemp)
+
+	// Counters derived from the event ring buffer.
+	var pumpRuns, interlockBlocks, failsafes, overtempEvents int64
+	if rec != nil {
+		for _, ev := range rec.Snapshot() {
+			switch ev.Kind {
+			case "pump_on":
+				pumpRuns++
+			case "interlock_block":
+				interlockBlocks++
+			case "pump_failsafe":
+				failsafes++
+			case "overtemp":
+				overtempEvents++
+			}
+		}
+	}
+	counter("gardynd_pump_runs", "Total number of pump-on events since start (approximate: counts ring buffer window).", pumpRuns)
+	counter("gardynd_interlock_blocks", "Total pump-on attempts blocked by the water-low interlock.", interlockBlocks)
+	counter("gardynd_failsafe", "Total pump failsafe activations.", failsafes)
+	counter("gardynd_overtemp_events", "Total over-temperature events recorded.", overtempEvents)
+
+	_, _ = fmt.Fprint(w, b.String())
 }

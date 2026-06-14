@@ -5,10 +5,11 @@ package core
 
 import (
 	"fmt"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 
+	"github.com/iot-root/garden-of-eden/internal/events"
 	"github.com/iot-root/garden-of-eden/internal/hw"
 	"github.com/iot-root/garden-of-eden/internal/state"
 )
@@ -51,6 +52,8 @@ type Core struct {
 	blockOnSensorError bool
 	pumpTimer          *time.Timer // core-goroutine only
 	pumpStateFile      string      // core-goroutine only after startup
+
+	rec *events.Recorder // guarded by nil-safe Recorder.Record; set via SetEvents
 }
 
 func New(dev hw.Devices, store *state.Store) *Core {
@@ -63,6 +66,10 @@ func New(dev hw.Devices, store *state.Store) *Core {
 		pumpLevel:  100,
 	}
 }
+
+// SetEvents wires an event recorder into the core. Must be called before
+// Run (no locking needed — Run and Submit are not yet in flight).
+func (c *Core) SetEvents(rec *events.Recorder) { c.rec = rec }
 
 func (c *Core) Submit(cmd Command) {
 	select {
@@ -160,20 +167,20 @@ func (c *Core) applyLight(cmd Command) {
 			c.lightLevel = cmd.Value
 		}
 		if err := c.dev.Light.SetBrightness(c.lightLevel); err != nil {
-			log.Printf("light on: %v", err)
+			slog.Error("light on", "err", err)
 			return
 		}
 		c.store.SetLight(true, c.lightLevel)
 	case ActionOff:
 		if err := c.dev.Light.Off(); err != nil {
-			log.Printf("light off: %v", err)
+			slog.Error("light off", "err", err)
 			return
 		}
 		c.store.SetLight(false, c.lightLevel)
 	case ActionSetLevel:
 		c.lightLevel = cmd.Value
 		if err := c.dev.Light.SetBrightness(cmd.Value); err != nil {
-			log.Printf("light level: %v", err)
+			slog.Error("light level", "err", err)
 			return
 		}
 		c.store.SetLight(cmd.Value > 0, cmd.Value)
@@ -190,16 +197,17 @@ func (c *Core) applyPump(cmd Command) {
 				// Distance read failed. Record sensor health, then apply policy.
 				c.store.SetWaterSensorOK(false)
 				if c.blockOnError() {
-					log.Printf("pump on: distance read failed, blocking (fail-closed): %v", err)
+					slog.Error("pump on: distance read failed, blocking (fail-closed)", "err", err)
 					c.flashLights()
 					return
 				}
-				log.Printf("pump on: distance read failed, proceeding (fail-open): %v", err)
+				slog.Warn("pump on: distance read failed, proceeding (fail-open)", "err", err)
 			} else {
 				c.store.SetWaterSensorOK(true)
 				if cm > threshold {
 					c.store.SetWater(threshold, true) // low=true
 					c.store.SetWaterSensorOK(true)    // SetWater zeroes SensorOK; restore it
+					c.rec.Record("interlock_block", fmt.Sprintf("distance=%.1fcm threshold=%.1fcm", cm, threshold))
 					c.flashLights()
 					return
 				}
@@ -211,32 +219,34 @@ func (c *Core) applyPump(cmd Command) {
 			c.pumpLevel = cmd.Value
 		}
 		if err := c.dev.Pump.SetSpeed(c.pumpLevel); err != nil {
-			log.Printf("pump on: %v", err)
+			slog.Error("pump on", "err", err)
 			return
 		}
 		if c.pumpStateFile != "" {
 			if err := writePumpState(c.pumpStateFile, time.Now()); err != nil {
-				log.Printf("pump state persist (continuing): %v", err)
+				slog.Warn("pump state persist (continuing)", "err", err)
 			}
 		}
 		c.armPumpFailsafe()
 		c.store.SetPump(true, c.pumpLevel)
+		c.rec.Record("pump_on", fmt.Sprintf("speed=%d", c.pumpLevel))
 	case ActionOff:
 		c.disarmPumpFailsafe()
 		if c.pumpStateFile != "" {
 			if err := clearPumpState(c.pumpStateFile); err != nil {
-				log.Printf("pump state clear (continuing): %v", err)
+				slog.Warn("pump state clear (continuing)", "err", err)
 			}
 		}
 		if err := c.dev.Pump.Off(); err != nil {
-			log.Printf("pump off: %v", err)
+			slog.Error("pump off", "err", err)
 			return
 		}
 		c.store.SetPump(false, c.pumpLevel)
+		c.rec.Record("pump_off", "")
 	case ActionSetLevel:
 		c.pumpLevel = cmd.Value
 		if err := c.dev.Pump.SetSpeed(cmd.Value); err != nil {
-			log.Printf("pump level: %v", err)
+			slog.Error("pump level", "err", err)
 			return
 		}
 		c.store.SetPump(cmd.Value > 0, cmd.Value)
@@ -246,9 +256,14 @@ func (c *Core) applyPump(cmd Command) {
 func (c *Core) applyOverTemp(cmd Command) {
 	alert := cmd.Value == 1
 	c.store.SetOverTemp(alert)
-	if alert && c.cutLightOnTemp() && c.dev.Light != nil {
-		_ = c.dev.Light.Off()
-		c.store.SetLight(false, c.lightLevel)
+	if alert {
+		c.rec.Record("overtemp", "")
+		if c.cutLightOnTemp() && c.dev.Light != nil {
+			_ = c.dev.Light.Off()
+			c.store.SetLight(false, c.lightLevel)
+		}
+	} else {
+		c.rec.Record("overtemp_clear", "")
 	}
 }
 
@@ -280,8 +295,9 @@ func (c *Core) armPumpFailsafe() {
 	}
 	c.disarmPumpFailsafe()
 	c.pumpTimer = time.AfterFunc(maxRT, func() {
+		c.rec.Record("pump_failsafe", fmt.Sprintf("after=%s", maxRT))
 		c.Submit(Command{Target: TargetPump, Action: ActionOff})
-		log.Printf("pump failsafe: forced off after %s", maxRT)
+		slog.Warn("pump failsafe: forced off", "after", maxRT)
 	})
 }
 
@@ -309,9 +325,9 @@ func (c *Core) disarmPumpFailsafe() {
 func (c *Core) EnforcePumpRuntime(path string, maxRuntime time.Duration, now time.Time) time.Duration {
 	startedAt, ok, err := readPumpState(path)
 	if err != nil {
-		log.Printf("pump state read at startup (clearing): %v", err)
+		slog.Warn("pump state read at startup (clearing)", "err", err)
 		if cerr := clearPumpState(path); cerr != nil {
-			log.Printf("pump state clear at startup: %v", cerr)
+			slog.Warn("pump state clear at startup", "err", cerr)
 		}
 		return 0
 	}
@@ -319,15 +335,15 @@ func (c *Core) EnforcePumpRuntime(path string, maxRuntime time.Duration, now tim
 		return 0
 	}
 	if ShouldForceOff(startedAt, now, maxRuntime) {
-		log.Printf("pump state: previous run exceeded max runtime (%s); forcing pump off", maxRuntime)
+		slog.Warn("pump state: previous run exceeded max runtime; forcing pump off", "maxRuntime", maxRuntime)
 		if c.dev.Pump != nil {
 			if oerr := c.dev.Pump.Off(); oerr != nil {
-				log.Printf("pump off at startup: %v", oerr)
+				slog.Error("pump off at startup", "err", oerr)
 			}
 		}
 		c.store.SetPump(false, c.pumpLevel)
 		if cerr := clearPumpState(path); cerr != nil {
-			log.Printf("pump state clear at startup: %v", cerr)
+			slog.Warn("pump state clear at startup", "err", cerr)
 		}
 		return 0
 	}

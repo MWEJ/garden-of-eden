@@ -2,7 +2,7 @@
 package discovery
 
 import (
-	"log"
+	"log/slog"
 
 	"github.com/grandcat/zeroconf"
 )
@@ -12,7 +12,7 @@ import (
 func Advertise(instance string, port int) func() {
 	server, err := zeroconf.Register(instance, "_gardynd._tcp", "local.", port, []string{"path=/state"}, nil)
 	if err != nil {
-		log.Printf("zeroconf advertise failed (continuing): %v", err)
+		slog.Warn("zeroconf advertise failed, continuing", "err", err)
 		return func() {}
 	}
 	return server.Shutdown

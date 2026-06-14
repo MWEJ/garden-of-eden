@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -15,6 +16,8 @@ import (
 	"github.com/iot-root/garden-of-eden/internal/config"
 	"github.com/iot-root/garden-of-eden/internal/core"
 	"github.com/iot-root/garden-of-eden/internal/discovery"
+	evtring "github.com/iot-root/garden-of-eden/internal/events"
+	"github.com/iot-root/garden-of-eden/internal/health"
 	"github.com/iot-root/garden-of-eden/internal/httpapi"
 	"github.com/iot-root/garden-of-eden/internal/hw"
 	"github.com/iot-root/garden-of-eden/internal/hw/mock"
@@ -36,6 +39,10 @@ func main() {
 	if *httpPort != 0 {
 		cfg.HTTP.Port = *httpPort
 	}
+
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: config.ParseLogLevel(cfg.LogLevel),
+	})))
 
 	// File-only baseline for persistence: runtime env/flag overrides live in
 	// cfg, but only file-originated values (plus API edits) are written back.
@@ -62,6 +69,10 @@ func main() {
 	st := state.New()
 	st.SetDeviceInfo(cfg.Device.Identifier, cfg.Device.Model, cfg.Device.Version)
 	c := core.New(devs, st)
+
+	rec := evtring.NewRecorder(100)
+	c.SetEvents(rec)
+
 	go c.Run()
 
 	// Core runtime config (setters are mutex-guarded, safe post-Run).
@@ -75,7 +86,7 @@ func main() {
 	// enforce the remaining max-runtime (or force off if already expired).
 	maxRT := time.Duration(cfg.Pump.MaxRuntimeSeconds) * time.Second
 	if remaining := c.EnforcePumpRuntime(cfg.Pump.StateFile, maxRT, time.Now()); remaining > 0 {
-		log.Printf("pump was running before restart; arming failsafe for remaining %s", remaining)
+		slog.Info("pump was running before restart; arming failsafe for remaining", "remaining", remaining)
 		time.AfterFunc(remaining, func() {
 			c.Submit(core.Command{Target: core.TargetPump, Action: core.ActionOff})
 		})
@@ -147,6 +158,10 @@ func main() {
 
 	frames := state.NewFrames()
 	pub := publish.New(devs, st, frames, time.Duration(cfg.TelemetryIntervalSeconds)*time.Second, onOverTemp)
+
+	tr := health.NewTracker()
+	pub.SetHealthTracker(tr)
+
 	go pub.Run()
 	go pub.RunCameras(time.Duration(cfg.Camera.IntervalSeconds) * time.Second)
 
@@ -183,25 +198,25 @@ func main() {
 	}
 
 	addr := fmt.Sprintf(":%d", cfg.HTTP.Port)
-	server := &http.Server{Addr: addr, Handler: httpapi.HandlerFull(c, st, devs, frames, deps)}
+	server := &http.Server{Addr: addr, Handler: httpapi.HandlerFull(c, st, devs, frames, deps, rec, tr)}
 	go func() {
-		log.Printf("REST listening on %s", addr)
+		slog.Info("REST listening", "addr", addr)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("http: %v", err)
+			slog.Error("http server failed", "err", err)
 		}
 	}()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
-	log.Printf("shutting down")
+	slog.Info("shutting down")
 
 	// 1. Stop accepting new HTTP requests and drain in-flight ones, so no late
 	//    request can turn the pump back on after we drive it off.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := server.Shutdown(shutdownCtx); err != nil {
-		log.Printf("http shutdown: %v", err)
+		slog.Error("http shutdown", "err", err)
 	}
 
 	// 2. Stop the button goroutine so it cannot submit a pump-on after this.
@@ -215,7 +230,7 @@ func main() {
 	//    pump off explicitly. This also clears the persisted pump-state file via
 	//    applyPump's ActionOff path.
 	if !submitAndWaitPumpOff(c, st, 3*time.Second) {
-		log.Printf("warning: pump did not confirm OFF within timeout")
+		slog.Warn("pump did not confirm OFF within timeout")
 	}
 
 	// 5. Stop the publishers and core, then withdraw discovery.
