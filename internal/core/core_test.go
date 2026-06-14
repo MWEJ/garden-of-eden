@@ -373,6 +373,61 @@ func TestInterlockBlockRecordsEvent(t *testing.T) {
 	}
 }
 
+func TestApplyLightFadeReachesTarget(t *testing.T) {
+	// Cap each fade step to 1ms so the test is fast.
+	old := fadeStepCap
+	fadeStepCap = time.Millisecond
+	defer func() { fadeStepCap = old }()
+
+	st := state.New()
+	devs := mock.New()
+	c := New(devs, st)
+	go c.Run()
+	defer c.Stop()
+
+	c.ApplyLightFade(100, 5) // ramp 0 -> 100 over (capped) steps
+
+	reachedMid := false
+	for i := 0; i < 500; i++ {
+		b := st.Snapshot().Light.Brightness
+		if b > 0 && b < 100 {
+			reachedMid = true
+		}
+		if b == 100 {
+			if !reachedMid {
+				t.Error("fade jumped to target without intermediate steps")
+			}
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Errorf("fade never reached 100, last=%d", st.Snapshot().Light.Brightness)
+}
+
+func TestNewCommandCancelsFade(t *testing.T) {
+	old := fadeStepCap
+	fadeStepCap = 5 * time.Millisecond
+	defer func() { fadeStepCap = old }()
+
+	st := state.New()
+	devs := mock.New()
+	c := New(devs, st)
+	go c.Run()
+	defer c.Stop()
+
+	c.ApplyLightFade(100, 30) // long ramp
+	time.Sleep(15 * time.Millisecond)
+	// Interrupt with a manual off.
+	c.Submit(Command{Target: TargetLight, Action: ActionOff})
+
+	// Give the canceled fade a chance to (wrongly) keep going.
+	time.Sleep(60 * time.Millisecond)
+	if st.Snapshot().Light.On {
+		t.Errorf("light On after off; fade was not cancelled (brightness=%d)",
+			st.Snapshot().Light.Brightness)
+	}
+}
+
 func TestPumpOnOffRecordsEvents(t *testing.T) {
 	st := state.New()
 	c := New(mock.New(), st)

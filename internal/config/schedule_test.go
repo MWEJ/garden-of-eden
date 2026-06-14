@@ -87,3 +87,56 @@ func TestDueBetweenMidnightCrossing(t *testing.T) {
 		t.Errorf("window not containing 00:00: due = %+v, want []", due3)
 	}
 }
+
+func TestValidateDaysTokens(t *testing.T) {
+	good := Schedule{Entries: []ScheduleEntry{
+		{At: "06:00", Action: "on", Brightness: 70, Days: []string{"Mon", "tue", "SUN"}},
+	}}
+	if err := good.Validate(); err != nil {
+		t.Errorf("good days: unexpected error %v", err)
+	}
+	bad := Schedule{Entries: []ScheduleEntry{
+		{At: "06:00", Action: "on", Days: []string{"funday"}},
+	}}
+	if err := bad.Validate(); err == nil {
+		t.Error("bad day token \"funday\": expected error, got nil")
+	}
+}
+
+func TestValidateSolarFields(t *testing.T) {
+	good := Schedule{Entries: []ScheduleEntry{
+		{Solar: "sunrise", SolarOffsetMin: -30, Action: "on", Brightness: 60},
+		{Solar: "sunset", SolarOffsetMin: 15, Action: "off"},
+	}}
+	if err := good.Validate(); err != nil {
+		t.Errorf("good solar: unexpected error %v", err)
+	}
+	bad := Schedule{Entries: []ScheduleEntry{
+		{Solar: "noon", Action: "on"},
+	}}
+	if err := bad.Validate(); err == nil {
+		t.Error("bad solar \"noon\": expected error, got nil")
+	}
+}
+
+func TestValidateNegativeFade(t *testing.T) {
+	bad := Schedule{Entries: []ScheduleEntry{
+		{At: "06:00", Action: "on", FadeMin: -5},
+	}}
+	if err := bad.Validate(); err == nil {
+		t.Error("negative fade: expected error, got nil")
+	}
+}
+
+func TestValidateBackCompatPlainEntry(t *testing.T) {
+	// A plain at-only entry must still validate exactly as before.
+	plain := Schedule{Entries: []ScheduleEntry{{At: "06:00", Action: "on", Brightness: 70}}}
+	if err := plain.Validate(); err != nil {
+		t.Errorf("plain entry: unexpected error %v", err)
+	}
+	// A solar entry needs no valid At.
+	solar := Schedule{Entries: []ScheduleEntry{{Solar: "sunrise", Action: "on"}}}
+	if err := solar.Validate(); err != nil {
+		t.Errorf("solar entry without At: unexpected error %v", err)
+	}
+}

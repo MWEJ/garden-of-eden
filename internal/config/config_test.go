@@ -238,7 +238,7 @@ func TestParseLogLevel(t *testing.T) {
 		{"info", "INFO"},
 		{"warn", "WARN"},
 		{"error", "ERROR"},
-		{"", "INFO"},     // empty → default
+		{"", "INFO"},      // empty → default
 		{"bogus", "INFO"}, // unknown → default
 	}
 	for _, tc := range cases {
@@ -288,5 +288,51 @@ func TestHTTPBindAddressEnvOverride(t *testing.T) {
 	}
 	if c.HTTP.BindAddress != "127.0.0.1" {
 		t.Errorf("HTTP.BindAddress = %q, want %q", c.HTTP.BindAddress, "127.0.0.1")
+	}
+}
+
+func TestLocationDefaultsEmpty(t *testing.T) {
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Location.Latitude != 0 || c.Location.Longitude != 0 || c.Location.TimeZone != "" {
+		t.Errorf("location defaults = %+v, want zero-value", c.Location)
+	}
+	// With no timezone, Zone() falls back to Local (never nil).
+	if c.Zone() == nil {
+		t.Error("Zone() returned nil")
+	}
+}
+
+func TestLocationEnvOverride(t *testing.T) {
+	t.Setenv("LAT", "40.7128")
+	t.Setenv("LON", "-74.0060")
+	t.Setenv("TZ", "America/New_York")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Location.Latitude != 40.7128 || c.Location.Longitude != -74.0060 {
+		t.Errorf("lat/lon = %v/%v, want 40.7128/-74.0060", c.Location.Latitude, c.Location.Longitude)
+	}
+	if c.Location.TimeZone != "America/New_York" {
+		t.Errorf("tz = %q, want America/New_York", c.Location.TimeZone)
+	}
+	loc := c.Zone()
+	if loc == nil || loc.String() != "America/New_York" {
+		t.Errorf("Zone() = %v, want America/New_York", loc)
+	}
+}
+
+func TestLocationInvalidTZFallsBack(t *testing.T) {
+	t.Setenv("TZ", "Not/AZone")
+	c, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Invalid zone must not panic and must not be nil.
+	if c.Zone() == nil {
+		t.Error("Zone() returned nil for invalid tz")
 	}
 }

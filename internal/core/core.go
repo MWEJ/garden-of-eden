@@ -14,6 +14,10 @@ import (
 	"github.com/iot-root/garden-of-eden/internal/state"
 )
 
+// fadeStepCap, when > 0, clamps each fade step's sleep. Production leaves it 0
+// (use the natural per-step delay); tests set it small to run fast.
+var fadeStepCap time.Duration
+
 type Target int
 
 const (
@@ -34,6 +38,14 @@ type Command struct {
 	Target Target
 	Action Action
 	Value  int
+
+	// fadeGen tags a command emitted by a fade goroutine with the fade
+	// generation that produced it. Zero means "not a fade step" (manual/
+	// scheduler command). The core applies a fade SetLevel only when fadeGen
+	// equals the currently-active generation, so a step that was already
+	// in-flight when a newer command (off/on/new fade) cancelled the ramp is
+	// dropped on the core goroutine — closing the cancel/Submit race.
+	fadeGen uint64
 }
 
 type Core struct {
@@ -52,6 +64,8 @@ type Core struct {
 	blockOnSensorError bool
 	pumpTimer          *time.Timer // core-goroutine only
 	pumpStateFile      string      // core-goroutine only after startup
+	fadeCancel         chan struct{} // guarded by cfgMu; closed to cancel an active fade
+	fadeGen            uint64        // guarded by cfgMu; active fade generation (0 = none)
 
 	rec *events.Recorder // guarded by nil-safe Recorder.Record; set via SetEvents
 }
@@ -161,6 +175,11 @@ func (c *Core) apply(cmd Command) {
 }
 
 func (c *Core) applyLight(cmd Command) {
+	if cmd.Action != ActionSetLevel {
+		// A fade drives the light via ActionSetLevel; only NON-fade commands
+		// (manual on/off, or a new fade) cancel an in-progress ramp.
+		c.cancelFade()
+	}
 	switch cmd.Action {
 	case ActionOn:
 		if cmd.Value > 0 {
@@ -178,6 +197,14 @@ func (c *Core) applyLight(cmd Command) {
 		}
 		c.store.SetLight(false, c.lightLevel)
 	case ActionSetLevel:
+		// Drop a fade step whose generation is no longer active: a newer
+		// command (off/on/new fade) cancelled this ramp after the step was
+		// already enqueued. Checked here on the core goroutine — the only
+		// place fadeGen and the device are both read — so there is no window
+		// for a stale step to land after the cancelling command.
+		if cmd.fadeGen != 0 && cmd.fadeGen != c.activeFadeGen() {
+			return
+		}
 		c.lightLevel = cmd.Value
 		if err := c.dev.Light.SetBrightness(cmd.Value); err != nil {
 			slog.Error("light level", "err", err)
@@ -188,6 +215,7 @@ func (c *Core) applyLight(cmd Command) {
 }
 
 func (c *Core) applyPump(cmd Command) {
+	c.cancelFade() // any pump action cancels a light fade per Decision 4
 	switch cmd.Action {
 	case ActionOn:
 		threshold := c.waterLow()
@@ -265,6 +293,82 @@ func (c *Core) applyOverTemp(cmd Command) {
 	} else {
 		c.rec.Record("overtemp_clear", "")
 	}
+}
+
+// ApplyLightFade ramps the light to `target` over fadeMin minutes. It cancels
+// any in-progress fade, then launches a goroutine that submits stepped
+// ActionSetLevel commands through the core (preserving single-writer mutation).
+// Any subsequent light/pump command cancels the fade via cancelFade.
+func (c *Core) ApplyLightFade(target, fadeMin int) {
+	from := 0
+	if c.dev.Light != nil {
+		from = c.dev.Light.Brightness()
+	}
+	steps := fadeSteps(from, target, fadeMin)
+
+	// Snapshot the step cap once on the caller's goroutine so the fade goroutine
+	// never reads the package var concurrently (keeps -race clean; tests mutate
+	// fadeStepCap before/after running a fade).
+	stepCap := fadeStepCap
+
+	cancel := make(chan struct{})
+	c.cfgMu.Lock()
+	if c.fadeCancel != nil {
+		close(c.fadeCancel)
+	}
+	c.fadeCancel = cancel
+	c.fadeGen++ // start a new generation; tags this fade's steps
+	gen := c.fadeGen
+	c.cfgMu.Unlock()
+
+	go func() {
+		for _, s := range steps {
+			d := s.delay
+			if stepCap > 0 && (d > stepCap || d == 0) {
+				d = stepCap
+			}
+			if d > 0 {
+				select {
+				case <-cancel:
+					return
+				case <-c.done:
+					return
+				case <-time.After(d):
+				}
+			}
+			select {
+			case <-cancel:
+				return
+			default:
+			}
+			// Tag the step with this fade's generation. Even if the channel
+			// close races with this Submit, the core drops the step when its
+			// generation is no longer active (see applyLight ActionSetLevel).
+			c.Submit(Command{Target: TargetLight, Action: ActionSetLevel, Value: s.level, fadeGen: gen})
+		}
+	}()
+}
+
+// cancelFade stops any active fade. Runs on the core goroutine (from applyLight/
+// applyPump) so a manual command instantly supersedes a ramp. It both closes the
+// cancel channel (stops the goroutine sleeping/looping) and clears the active
+// generation (drops any step already enqueued behind the cancelling command).
+func (c *Core) cancelFade() {
+	c.cfgMu.Lock()
+	if c.fadeCancel != nil {
+		close(c.fadeCancel)
+		c.fadeCancel = nil
+	}
+	c.fadeGen = 0
+	c.cfgMu.Unlock()
+}
+
+// activeFadeGen returns the currently-active fade generation under cfgMu (0 when
+// no fade is active).
+func (c *Core) activeFadeGen() uint64 {
+	c.cfgMu.Lock()
+	defer c.cfgMu.Unlock()
+	return c.fadeGen
 }
 
 func (c *Core) measureDistance() (float64, error) {

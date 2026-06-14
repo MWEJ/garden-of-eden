@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -53,6 +54,12 @@ type OverTempConfig struct {
 	CutLight bool `yaml:"cut_light"`
 }
 
+type LocationConfig struct {
+	Latitude  float64 `yaml:"latitude"`
+	Longitude float64 `yaml:"longitude"`
+	TimeZone  string  `yaml:"timezone"` // IANA name, e.g. "America/New_York"
+}
+
 type Config struct {
 	HTTP                     HTTPConfig     `yaml:"http"`
 	Device                   DeviceConfig   `yaml:"device"`
@@ -62,6 +69,7 @@ type Config struct {
 	Water                    WaterConfig    `yaml:"water"`
 	Pump                     PumpConfig     `yaml:"pump"`
 	OverTemp                 OverTempConfig `yaml:"overtemp"`
+	Location                 LocationConfig `yaml:"location"`
 	TelemetryIntervalSeconds int            `yaml:"telemetry_interval_seconds"`
 	LogLevel                 string         `yaml:"log_level"`
 }
@@ -139,6 +147,9 @@ func applyEnv(c *Config) {
 	envStr(&c.Pump.StateFile, "PUMP_STATE_FILE")
 	envInt(&c.TelemetryIntervalSeconds, "TELEMETRY_INTERVAL_SECONDS")
 	envStr(&c.LogLevel, "LOG_LEVEL")
+	envFloat(&c.Location.Latitude, "LAT")
+	envFloat(&c.Location.Longitude, "LON")
+	envStr(&c.Location.TimeZone, "TZ")
 }
 
 func (c Config) Save(path string) error {
@@ -169,6 +180,32 @@ func (c Config) Save(path string) error {
 		return err
 	}
 	return nil
+}
+
+// Zone returns the *time.Location for the configured IANA timezone. When unset
+// or invalid it falls back to time.Local; it never returns nil. The scheduler
+// uses this for DST-correct evaluation.
+func (c Config) Zone() *time.Location {
+	if c.Location.TimeZone == "" {
+		return time.Local
+	}
+	loc, err := time.LoadLocation(c.Location.TimeZone)
+	if err != nil {
+		return time.Local
+	}
+	return loc
+}
+
+// HasSolarEntry reports whether any schedule entry resolves from a solar event.
+func (c Config) HasSolarEntry() bool {
+	for _, s := range []Schedule{c.Schedules.Light, c.Schedules.Pump} {
+		for _, e := range s.Entries {
+			if e.HasSolar() {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func envStr(dst *string, key string) {

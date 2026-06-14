@@ -144,7 +144,16 @@ func main() {
 		return persist()
 	}
 
-	sched := core.NewScheduler(c, getSchedules)
+	if cfg.HasSolarEntry() && cfg.Location.Latitude == 0 && cfg.Location.Longitude == 0 {
+		slog.Warn("solar schedule entries present but location lat/lon unset; " +
+			"solar times will be computed at (0,0). Set LAT/LON or config location.")
+	}
+	sl := config.SchedLocation{
+		Loc: cfg.Zone(),
+		Lat: cfg.Location.Latitude,
+		Lon: cfg.Location.Longitude,
+	}
+	sched := core.NewSchedulerLoc(c, getSchedules, sl, config.NOAASun{})
 	go sched.Run()
 
 	// Over-temp monitor: the publisher reads PCBTemp.OverTemp() each cycle and
