@@ -131,8 +131,8 @@ func TestSubscribeFullChannelDoesNotBlockSetter(t *testing.T) {
 	defer cancel()
 
 	// Fill the channel without draining it.
-	s.SetLight(true, 50)  // first notify — fills the buffer
-	s.SetPump(true, 100)  // second notify — channel full, must NOT block
+	s.SetLight(true, 50) // first notify — fills the buffer
+	s.SetPump(true, 100) // second notify — channel full, must NOT block
 
 	// The setter returned promptly (no deadlock). Drain once.
 	select {

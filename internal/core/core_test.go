@@ -293,7 +293,7 @@ func TestEnforcePumpRuntimeExpiredForcesOffAndClears(t *testing.T) {
 	}
 	st := state.New()
 	devs := mock.New()
-	devs.Pump.(*mock.Pump).SetSpeed(100) // pretend hardware is still running
+	_ = devs.Pump.(*mock.Pump).SetSpeed(100) // pretend hardware is still running
 	c := New(devs, st)
 
 	remaining := c.EnforcePumpRuntime(path, 10*time.Minute, time.Now())

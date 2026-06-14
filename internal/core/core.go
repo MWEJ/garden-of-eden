@@ -62,8 +62,8 @@ type Core struct {
 	pumpMaxRuntime     time.Duration
 	cutLightOnOverTemp bool
 	blockOnSensorError bool
-	pumpTimer          *time.Timer // core-goroutine only
-	pumpStateFile      string      // core-goroutine only after startup
+	pumpTimer          *time.Timer   // core-goroutine only
+	pumpStateFile      string        // core-goroutine only after startup
 	fadeCancel         chan struct{} // guarded by cfgMu; closed to cancel an active fade
 	fadeGen            uint64        // guarded by cfgMu; active fade generation (0 = none)
 

@@ -34,7 +34,7 @@ func (c *V4L2Camera) Capture() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open %s: %w", c.devPath, err)
 	}
-	defer dev.Close()
+	defer func() { _ = dev.Close() }()
 
 	const captureTimeout = 10 * time.Second
 	ctx, cancel := context.WithTimeout(context.Background(), captureTimeout)
@@ -44,6 +44,8 @@ func (c *V4L2Camera) Capture() ([]byte, error) {
 		return nil, fmt.Errorf("start %s: %w", c.devPath, err)
 	}
 
+	//nolint:staticcheck // GetOutput is deprecated in favor of GetFrames(); migrating
+	// needs on-device perf testing (go4vl buffer pooling) — tracked as a follow-up.
 	frames := dev.GetOutput()
 	var frame []byte
 	const warmup = 2

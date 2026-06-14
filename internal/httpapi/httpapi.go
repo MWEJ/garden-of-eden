@@ -301,7 +301,7 @@ func streamHandler(st *state.Store) http.HandlerFunc {
 			if err != nil {
 				return
 			}
-			fmt.Fprintf(w, "data: %s\n\n", b)
+			_, _ = fmt.Fprintf(w, "data: %s\n\n", b)
 			flusher.Flush()
 		}
 		sendSnapshot()
@@ -317,7 +317,7 @@ func streamHandler(st *state.Store) http.HandlerFunc {
 				sendSnapshot()
 			case <-heartbeat.C:
 				// SSE comment line — keeps the connection alive through proxies/NAT.
-				fmt.Fprintf(w, ": heartbeat\n\n")
+				_, _ = fmt.Fprint(w, ": heartbeat\n\n")
 				flusher.Flush()
 			}
 		}

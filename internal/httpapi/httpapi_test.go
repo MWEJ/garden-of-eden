@@ -479,7 +479,7 @@ func TestMaxBodySizeRejectsOversizedRequest(t *testing.T) {
 	// *http.MaxBytesError, which levelHandler maps to 400.
 	// A repeated stream of {"value":1} does NOT trigger the limit because
 	// json.Decoder only reads the first 11-byte object and returns immediately.
-	noise := strings.Repeat("A", (2<<20))
+	noise := strings.Repeat("A", (2 << 20))
 	oversized := `{"value":1,"noise":"` + noise + `"}`
 	req := httptest.NewRequest(http.MethodPost, "/light/brightness", strings.NewReader(oversized))
 	rec := httptest.NewRecorder()
@@ -563,7 +563,7 @@ func TestSSEStreamDeliversDataFrame(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("SSE status = %d, want 200", resp.StatusCode)

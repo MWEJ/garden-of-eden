@@ -48,7 +48,7 @@ func (h *HCSR04) measureOnce() (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer trig.Close()
+	defer func() { _ = trig.Close() }()
 
 	rise := make(chan time.Time, 1)
 	fall := make(chan time.Time, 1)
@@ -71,7 +71,7 @@ func (h *HCSR04) measureOnce() (float64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer echo.Close()
+	defer func() { _ = echo.Close() }()
 
 	// Drain any spurious edge events captured before the trigger pulse, so a
 	// stale rising edge can't be mistaken for t0.
